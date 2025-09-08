@@ -1,7 +1,4 @@
-"""Airflow task: compact details CSVs into a daily parquet artifact."""
+# airflow/dags/tasks/compact_details.py
 from immoeliza.scraping.details_compact import compact
-
-def run(**context):
-    task_id = context["task"].task_id
-    kind = "apartments" if "apartment" in task_id else "houses"
+def run(kind: str):
     return compact(kind)

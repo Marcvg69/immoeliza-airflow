@@ -1,3 +1,4 @@
-from immoeliza.analytics.cleaning import run_for_training
+from immoeliza.cleaning.training_clean import run
+
 def run(**context):
     return run_for_training()

@@ -1,127 +1,130 @@
 # airflow/dags/immoeliza_pipeline_dag.py
-"""
-ImmoEliza end-to-end pipeline DAG.
-
-Per kind (apartments & houses):
-  scrape_*  →  store_raw_*  →  fetch_*_details  →  compact_*_details
-Both kinds then fan-in to:
-  clean_for_analysis  →  clean_for_training  →  train_regression  →  notify
-"""
-
+from __future__ import annotations
+import os, sys
+from pathlib import Path
 from datetime import datetime, timedelta
 
+# Make our package importable inside Airflow workers
+SRC = Path(__file__).resolve().parents[2] / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
 from airflow import DAG
-from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator
-from airflow.models.param import Param
 
-# ---- Task wrappers (kept tiny; live in airflow/dags/tasks/) ----
-import tasks.scrape_apartments as tsa
-import tasks.scrape_houses as tsh
-import tasks.store_raw as tsr
-import tasks.fetch_details as tfd
-import tasks.compact_details as tcd
+# --- task callables (thin wrappers that live under airflow/dags/tasks) ---
+from tasks.scrape_apartments import run as t_scrape_apartments
+from tasks.scrape_houses import run as t_scrape_houses
+from tasks.store_raw import run as t_store_raw
+from tasks.fetch_details import run as t_fetch_details
+from tasks.compact_details import run as t_compact_details
+from tasks.clean_for_analysis import run as t_clean_for_analysis
+from tasks.clean_for_training import run as t_clean_for_training
+from tasks.train_regression import run as t_train_regression
+from tasks.save_analytics import run as t_save_analytics
+from tasks.save_model import run as t_save_model
+from tasks.notify import run as t_notify
 
-# NEW: cleaning + training
-import tasks.clean_for_analysis as tca
-import tasks.clean_for_training as tct
-import tasks.train_regression as ttr
-
-# Final notification (placeholder)
-import tasks.notify as tn
-
-
-DEFAULT_ARGS = {
+default_args = {
+    "owner": "immo",
+    "depends_on_past": False,
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
 }
 
 with DAG(
     dag_id="immoeliza_pipeline",
-    description="Scrape → Consolidate → Details → Compact → Clean → Train",
+    description="Immo-Eliza end-to-end ETL + model",
     start_date=datetime(2025, 9, 1),
-    schedule_interval=None,   # set a cron later (e.g., "0 3 * * *")
+    schedule_interval="0 3 * * *",  # daily @ 03:00
     catchup=False,
-    default_args=DEFAULT_ARGS,
-    tags=["immoeliza", "real-estate"],
-    params={
-        # Set during manual trigger to limit details scrape size (0 = unlimited)
-        "details_limit": Param(0, type="integer", minimum=0),
-        # Optional override for train task; otherwise it picks latest training.parquet
-        "training_path": Param("", type="string"),
-    },
+    default_args=default_args,
+    max_active_runs=1,
+    tags=["immoeliza"],
 ) as dag:
 
-    start = EmptyOperator(task_id="start")
-
-    # -------- Apartments branch --------
+    # --- 1) URL scraping per kind ---
     scrape_apartments = PythonOperator(
         task_id="scrape_apartments",
-        python_callable=tsa.run,
+        python_callable=t_scrape_apartments,
     )
-
-    store_raw_apartments = PythonOperator(
-        task_id="store_raw_apartments",
-        python_callable=tsr.run,
-    )
-
-    fetch_apartment_details = PythonOperator(
-        task_id="fetch_apartment_details",
-        python_callable=tfd.run,   # reads params.details_limit if provided
-    )
-
-    compact_apartment_details = PythonOperator(
-        task_id="compact_apartment_details",
-        python_callable=tcd.run,
-    )
-
-    # -------- Houses branch --------
     scrape_houses = PythonOperator(
         task_id="scrape_houses",
-        python_callable=tsh.run,
+        python_callable=t_scrape_houses,
     )
 
+    # --- 2) Consolidate URLs to daily parquet ---
+    store_raw_apartments = PythonOperator(
+        task_id="store_raw_apartments",
+        python_callable=t_store_raw,
+        op_kwargs={"kind": "apartments"},
+    )
     store_raw_houses = PythonOperator(
         task_id="store_raw_houses",
-        python_callable=tsr.run,
+        python_callable=t_store_raw,
+        op_kwargs={"kind": "houses"},
     )
 
-    fetch_house_details = PythonOperator(
-        task_id="fetch_house_details",
-        python_callable=tfd.run,   # reads params.details_limit if provided
+    # --- 3) Fetch details from consolidated URLs ---
+    fetch_details_apartments = PythonOperator(
+        task_id="fetch_details_apartments",
+        python_callable=t_fetch_details,
+        op_kwargs={"kind": "apartments", "limit": None},  # set limit to small int for smoke tests
+    )
+    fetch_details_houses = PythonOperator(
+        task_id="fetch_details_houses",
+        python_callable=t_fetch_details,
+        op_kwargs={"kind": "houses", "limit": None},
     )
 
-    compact_house_details = PythonOperator(
-        task_id="compact_house_details",
-        python_callable=tcd.run,
+    # --- 4) Compact all detail CSVs to 1 parquet per kind ---
+    compact_details_apartments = PythonOperator(
+        task_id="compact_details_apartments",
+        python_callable=t_compact_details,
+        op_kwargs={"kind": "apartments"},
+    )
+    compact_details_houses = PythonOperator(
+        task_id="compact_details_houses",
+        python_callable=t_compact_details,
+        op_kwargs={"kind": "houses"},
     )
 
-    # -------- NEW: Cleaning & Training fan-in --------
+    # --- 5) Analytics DuckDB + training parquet ---
     clean_for_analysis = PythonOperator(
         task_id="clean_for_analysis",
-        python_callable=tca.run,
+        python_callable=t_clean_for_analysis,
     )
-
     clean_for_training = PythonOperator(
         task_id="clean_for_training",
-        python_callable=tct.run,
+        python_callable=t_clean_for_training,
     )
 
+    # --- 6) Train model (saves artifact) ---
     train_regression = PythonOperator(
         task_id="train_regression",
-        python_callable=ttr.run,
+        python_callable=t_train_regression,
+    )
+    save_model = PythonOperator(
+        task_id="save_model",
+        python_callable=t_save_model,   # reads the artifact path or just logs
     )
 
-    done = PythonOperator(
+    # --- 7) Save analytics + notify ---
+    save_analytics = PythonOperator(
+        task_id="save_analytics",
+        python_callable=t_save_analytics,
+    )
+    notify = PythonOperator(
         task_id="notify",
-        python_callable=tn.run,
+        python_callable=t_notify,
+        trigger_rule="all_done",
     )
 
-    # -------- Dependencies --------
-    start >> [scrape_apartments, scrape_houses]
+    # ---- graph ----
+    scrape_apartments >> store_raw_apartments >> fetch_details_apartments >> compact_details_apartments
+    scrape_houses     >> store_raw_houses     >> fetch_details_houses     >> compact_details_houses
 
-    scrape_apartments >> store_raw_apartments >> fetch_apartment_details >> compact_apartment_details
-    scrape_houses     >> store_raw_houses     >> fetch_house_details     >> compact_house_details
+    [compact_details_apartments, compact_details_houses] >> clean_for_analysis >> save_analytics
+    [compact_details_apartments, compact_details_houses] >> clean_for_training >> train_regression >> save_model
 
-    [compact_apartment_details, compact_house_details] >> clean_for_analysis
-    clean_for_analysis >> clean_for_training >> train_regression >> done
+    [save_analytics, save_model] >> notify

@@ -1,9 +1,5 @@
-"""Airflow task: fetch property details for URLs parquet."""
-from immoeliza.scraping.details import run as run_details
+# airflow/dags/tasks/fetch_details.py
+from immoeliza.scraping.details import run as fetch_run
+def run(kind: str, limit: int | None = None):
+    return fetch_run(kind, limit=limit)
 
-def run(**context):
-    task_id = context["task"].task_id
-    kind = "apartments" if "apartment" in task_id else "houses"
-    conf = getattr(context.get("dag_run"), "conf", {}) or {}
-    limit = conf.get("details_limit")  # optional: {"details_limit": 50}
-    return run_details(kind, limit=limit)
