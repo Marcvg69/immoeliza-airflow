@@ -1,46 +1,127 @@
+# airflow/dags/immoeliza_pipeline_dag.py
+"""
+ImmoEliza end-to-end pipeline DAG.
+
+Per kind (apartments & houses):
+  scrape_*  →  store_raw_*  →  fetch_*_details  →  compact_*_details
+Both kinds then fan-in to:
+  clean_for_analysis  →  clean_for_training  →  train_regression  →  notify
+"""
+
 from datetime import datetime, timedelta
+
 from airflow import DAG
-from airflow.operators.python import PythonOperator
 from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
+from airflow.models.param import Param
 
-def _noop():
-    return "ok"
+# ---- Task wrappers (kept tiny; live in airflow/dags/tasks/) ----
+import tasks.scrape_apartments as tsa
+import tasks.scrape_houses as tsh
+import tasks.store_raw as tsr
+import tasks.fetch_details as tfd
+import tasks.compact_details as tcd
 
-default_args = dict(owner="vincent", retries=1, retry_delay=timedelta(minutes=5))
+# NEW: cleaning + training
+import tasks.clean_for_analysis as tca
+import tasks.clean_for_training as tct
+import tasks.train_regression as ttr
+
+# Final notification (placeholder)
+import tasks.notify as tn
+
+
+DEFAULT_ARGS = {
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
 
 with DAG(
     dag_id="immoeliza_pipeline",
-    start_date=datetime(2025, 1, 1),
-    schedule_interval="0 2 * * *",
+    description="Scrape → Consolidate → Details → Compact → Clean → Train",
+    start_date=datetime(2025, 9, 1),
+    schedule_interval=None,   # set a cron later (e.g., "0 3 * * *")
     catchup=False,
-    default_args=default_args,
-    tags=["immoeliza"],
+    default_args=DEFAULT_ARGS,
+    tags=["immoeliza", "real-estate"],
+    params={
+        # Set during manual trigger to limit details scrape size (0 = unlimited)
+        "details_limit": Param(0, type="integer", minimum=0),
+        # Optional override for train task; otherwise it picks latest training.parquet
+        "training_path": Param("", type="string"),
+    },
 ) as dag:
 
     start = EmptyOperator(task_id="start")
 
-    # Placeholders - replace python_callable with real functions later
-    scrape_apartments = PythonOperator(task_id="scrape_apartments", python_callable=_noop)
-    store_raw_apartments = PythonOperator(task_id="store_raw_apartments", python_callable=_noop)
+    # -------- Apartments branch --------
+    scrape_apartments = PythonOperator(
+        task_id="scrape_apartments",
+        python_callable=tsa.run,
+    )
 
-    scrape_houses = PythonOperator(task_id="scrape_houses", python_callable=_noop)
-    store_raw_houses = PythonOperator(task_id="store_raw_houses", python_callable=_noop)
+    store_raw_apartments = PythonOperator(
+        task_id="store_raw_apartments",
+        python_callable=tsr.run,
+    )
 
-    raw_all_ready = EmptyOperator(task_id="raw_all_ready")
+    fetch_apartment_details = PythonOperator(
+        task_id="fetch_apartment_details",
+        python_callable=tfd.run,   # reads params.details_limit if provided
+    )
 
-    clean_for_analysis = PythonOperator(task_id="clean_for_analysis", python_callable=_noop)
-    save_analytics_duckdb = PythonOperator(task_id="save_analytics_duckdb", python_callable=_noop)
+    compact_apartment_details = PythonOperator(
+        task_id="compact_apartment_details",
+        python_callable=tcd.run,
+    )
 
-    clean_for_training = PythonOperator(task_id="clean_for_training", python_callable=_noop)
-    save_training_dataset = PythonOperator(task_id="save_training_dataset", python_callable=_noop)
-    train_regression = PythonOperator(task_id="train_regression", python_callable=_noop)
-    save_model = PythonOperator(task_id="save_model", python_callable=_noop)
+    # -------- Houses branch --------
+    scrape_houses = PythonOperator(
+        task_id="scrape_houses",
+        python_callable=tsh.run,
+    )
 
-    finished = EmptyOperator(task_id="finished")
+    store_raw_houses = PythonOperator(
+        task_id="store_raw_houses",
+        python_callable=tsr.run,
+    )
 
+    fetch_house_details = PythonOperator(
+        task_id="fetch_house_details",
+        python_callable=tfd.run,   # reads params.details_limit if provided
+    )
+
+    compact_house_details = PythonOperator(
+        task_id="compact_house_details",
+        python_callable=tcd.run,
+    )
+
+    # -------- NEW: Cleaning & Training fan-in --------
+    clean_for_analysis = PythonOperator(
+        task_id="clean_for_analysis",
+        python_callable=tca.run,
+    )
+
+    clean_for_training = PythonOperator(
+        task_id="clean_for_training",
+        python_callable=tct.run,
+    )
+
+    train_regression = PythonOperator(
+        task_id="train_regression",
+        python_callable=ttr.run,
+    )
+
+    done = PythonOperator(
+        task_id="notify",
+        python_callable=tn.run,
+    )
+
+    # -------- Dependencies --------
     start >> [scrape_apartments, scrape_houses]
-    scrape_apartments >> store_raw_apartments >> raw_all_ready
-    scrape_houses >> store_raw_houses >> raw_all_ready
-    raw_all_ready >> [clean_for_analysis, clean_for_training]
-    clean_for_analysis >> save_analytics_duckdb
-    clean_for_training >> save_training_dataset >> train_regression >> save_model >> finished
+
+    scrape_apartments >> store_raw_apartments >> fetch_apartment_details >> compact_apartment_details
+    scrape_houses     >> store_raw_houses     >> fetch_house_details     >> compact_house_details
+
+    [compact_apartment_details, compact_house_details] >> clean_for_analysis
+    clean_for_analysis >> clean_for_training >> train_regression >> done

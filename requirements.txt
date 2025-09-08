@@ -1,3 +1,8 @@
+
+selenium>=4.21.0
+selenium-wire>=5.1.0
+webdriver-manager>=4.0.1
+
 # Orchestrator
 apache-airflow==2.9.3
 
@@ -33,3 +38,5 @@ black
 isort
 flake8
 mypy
+blinker==1.7.0
+pydantic-settings>=2.3.0

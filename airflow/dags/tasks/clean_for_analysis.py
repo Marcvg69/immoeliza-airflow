@@ -1,3 +1,3 @@
-"""Airflow task placeholder."""
+from immoeliza.analytics.cleaning import run_for_analysis
 def run(**context):
-    return "ok"
+    return run_for_analysis()
