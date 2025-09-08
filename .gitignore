@@ -1,0 +1,78 @@
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.tox/
+coverage.xml
+htmlcov/
+
+# -------------------------
+# Virtual Environments
+# -------------------------
+.venv/
+venv/
+ENV/
+
+# -------------------------
+# Environment files
+# (keep .env.example in git)
+# -------------------------
+.env
+.env.*
+!.env.example
+
+# -------------------------
+# macOS / Editors
+# -------------------------
+.DS_Store
+.vscode/
+.idea/
+
+# -------------------------
+# Airflow
+# -------------------------
+airflow/logs/
+airflow/airflow.db
+airflow/airflow.cfg
+airflow/unittests.cfg
+airflow/*.pid
+
+# -------------------------
+# Data & Artifacts
+# Keep folder structure via .gitkeep
+# -------------------------
+data/**
+!data/.gitkeep
+
+analytics/**
+!analytics/.gitkeep
+analytics/*.duckdb
+
+models/**
+!models/.gitkeep
+
+# -------------------------
+# Streamlit / Web UI
+# -------------------------
+.streamlit/
+webui/__pycache__/
+
+# -------------------------
+# Notebooks
+# -------------------------
+.ipynb_checkpoints/
+
+# -------------------------
+# Node (if ever added)
+# -------------------------
+node_modules/

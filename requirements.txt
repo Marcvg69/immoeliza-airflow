@@ -1,0 +1,35 @@
+# Orchestrator
+apache-airflow==2.9.3
+
+# Scraping
+requests
+beautifulsoup4
+lxml
+httpx
+tenacity
+fake-useragent
+
+# Data and utils
+pandas
+numpy
+pyarrow
+python-dotenv
+pydantic>=2
+tqdm
+
+# Storage / SQL
+duckdb
+sqlalchemy
+
+# Modeling
+scikit-learn
+joblib
+
+# Web UI
+streamlit
+
+# Optional devx
+black
+isort
+flake8
+mypy
