@@ -13,6 +13,8 @@ airflow/airflow.db
 airflow/airflow.cfg
 airflow/logs/
 airflow/standalone_admin.log
+.airflow/
+airflow_home/
 
 # data & analytics (keep processed if you like)
 data/

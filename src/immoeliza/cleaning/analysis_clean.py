@@ -2,514 +2,305 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Tuple
 
 import duckdb
 import numpy as np
 import pandas as pd
 
-logger = logging.getLogger("immoeliza.scraping")
-logging.basicConfig(level=os.environ.get("IMMO_LOGLEVEL", "INFO"))
+LOG_PREFIX = "immoeliza.scraping"
+DATA_ROOT = Path(os.getenv("IMMO_DATA_ROOT", "data"))
+AN_PROC_DIR = DATA_ROOT / "processed" / "analysis"
+AN_RAW_DIR = DATA_ROOT / "interim" / "analysis"
+DUCKDB_PATH = Path(os.getenv("IMMO_ANALYTICS_DB", "analytics/immoeliza.duckdb"))
 
-# -------------------------------------------------------------------
-# Paths & helpers
-# -------------------------------------------------------------------
+# --------- tiny logger ----------
+def _log(msg: str) -> None:
+    print(f"INFO:{LOG_PREFIX}:{msg}")
 
-ANALYTICS_DB_ENV = "IMMO_ANALYTICS_DB"
-DEFAULT_ANALYTICS_DB = "analytics/immoeliza.duckdb"
-
-def _analytics_db_path() -> str:
-    return os.environ.get(ANALYTICS_DB_ENV, DEFAULT_ANALYTICS_DB)
-
-def _today_str() -> str:
-    return date.today().isoformat()
-
-def _ensure_parent(p: Path) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-
-def _processed_analysis_out() -> Path:
-    out = Path(f"data/processed/analysis/{_today_str()}/listings.parquet")
-    _ensure_parent(out)
-    return out
-
-# -------------------------------------------------------------------
-# Region mapping (simple BE heuristic)
-# -------------------------------------------------------------------
-
-def postal_to_region(postal_code: Optional[str | int]) -> Optional[str]:
-    if postal_code is None:
+# --------- parsing helpers ----------
+_num_re = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
+def _to_float(x) -> float | None:
+    if x is None:
         return None
-    try:
-        pc = int(str(postal_code)[:4])
-    except Exception:
+    if isinstance(x, (int, float, np.number)):
+        return float(x)
+    s = str(x).strip()
+    if s == "" or s.lower() in {"none", "nan"}:
         return None
-    if 1000 <= pc <= 1299:
-        return "Brussels-Capital"
-    first = int(str(pc)[0])
-    if first in (1, 2, 3, 8, 9):
-        return "Flanders"
-    if first in (4, 5, 6, 7):
-        return "Wallonia"
-    return None
-
-# -------------------------------------------------------------------
-# Numeric parsing helpers
-# -------------------------------------------------------------------
-
-_NUM_TOKEN = re.compile(r"(\d{1,9}(?:[ .\u00A0]\d{3})*(?:[,\.]\d{1,2})?|\d{1,6}(?:[,\.]\d{1,2})?)")
-_EUR_HINT = re.compile(r"(?:^|[\s:])(?:€|eur|euro)s?", re.I)
-_K_SUFFIX = re.compile(r"\b(\d+(?:[.,]\d+)?)\s*k\b", re.I)
-
-def _clean_number_token(tok: str) -> float | None:
-    s = tok.strip().replace("\u00A0", " ").replace(" ", "")
-    # if we still have both '.' and ',', assume '.' is thousands sep and ',' is decimal
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    else:
-        # otherwise remove thousands sep (.) and keep decimal (.)
-        # and convert decimal comma to dot
-        s = s.replace(".", "")
-        s = s.replace(",", ".")
+    m = _num_re.findall(s)
+    if not m:
+        return None
+    s = m[0].replace(",", ".")
     try:
         return float(s)
     except Exception:
         return None
 
-def _find_first_number(text: str) -> float | None:
-    if not isinstance(text, str) or not text:
+def _mid_from_range(text: str) -> float | None:
+    # capture like "85–90 m²" or "85-90"
+    if not isinstance(text, str):
         return None
-    m = _NUM_TOKEN.search(text)
-    if not m:
-        return None
-    return _clean_number_token(m.group(1))
-
-def _parse_money_like(text: str) -> float | None:
-    """Try to parse euros from a free-text cell."""
-    if not isinstance(text, str) or not text:
-        return None
-    t = text.strip()
-    # explicit k-suffix (e.g., "254,5k")
-    mk = _K_SUFFIX.search(t)
-    if mk:
-        fv = _clean_number_token(mk.group(1))
-        if fv is not None:
-            return fv * 1_000.0
-    # currency hint + number
-    if _EUR_HINT.search(t):
-        fv = _find_first_number(t)
-        return fv
-    # fallback: just first number
-    return _find_first_number(t)
-
-def _round_price_if_k(series: pd.Series) -> pd.Series:
-    """If series looks like 'thousands' (e.g., med=250), multiply by 1_000."""
-    s = pd.to_numeric(series, errors="coerce")
-    if s.notna().sum() == 0:
-        return s
-    med = s.dropna().median()
-    q90 = s.dropna().quantile(0.90)
-    mx = s.dropna().max()
-    if (med < 2_000) and (q90 < 2_000) and (mx <= 2_000):
-        logger.info("Applied price unit guard: multiplied by 1_000 (med=%.1f, q90=%.1f before scaling)", med, q90)
-        return s * 1_000.0
-    return s
-
-# -------------------------------------------------------------------
-# Surface extraction
-# -------------------------------------------------------------------
-
-_AREA_NAME_HINTS = [
-    "surface", "area", "habitable", "woon", "bewoon", "utile", "brute",
-    "net", "gross", "land", "lot", "wohn", "fläche", "superficie", "sqm", "m²", "m2",
-]
-
-_M2_PAT = re.compile(
-    r"(?<!\d)(\d{1,4}(?:[.,]\d{1,2})?)\s*(?:m2|m\u00B2|m²|sqm|sq\s*m|m\s*2)\b",
-    flags=re.IGNORECASE,
-)
-_NUM_PAT = re.compile(r"(\d{1,4}(?:[.,]\d{1,2})?)")
-
-def _to_float(x) -> Optional[float]:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return None
-    if isinstance(x, (int, float, np.number)):
-        return float(x)
-    s = str(x).strip().replace("\u00A0", " ").replace("\xa0", " ").replace(",", ".")
-    m = _NUM_PAT.search(s)
-    if not m:
-        return None
-    try:
-        return float(m.group(1))
-    except Exception:
-        return None
-
-def _search_m2_in_text(text: str) -> Optional[float]:
-    if not isinstance(text, str) or not text:
-        return None
-    t = " ".join(text.split())
-    m = _M2_PAT.search(t)
-    if m:
-        return _to_float(m.group(1))
+    parts = re.split(r"[–\-to]+", text)
+    nums = []
+    for p in parts[:2]:
+        v = _to_float(p)
+        if v is not None:
+            nums.append(v)
+    if len(nums) == 2:
+        return float(np.mean(nums))
     return None
 
-def _extract_surface_from_jsonish(cell: str) -> Optional[float]:
-    try:
-        s = str(cell)
-        start, end = s.find("{"), s.rfind("}")
-        if start >= 0 and end > start:
-            obj = json.loads(s[start:end+1])
-
-            def scan(o):
-                if isinstance(o, dict):
-                    for k, v in o.items():
-                        lk = str(k).lower()
-                        if any(h in lk for h in ("floorsize", "floor_size", "surface", "area")):
-                            if isinstance(v, dict):
-                                val = v.get("value") or v.get("amount") or v.get("m2") or v.get("size")
-                                fv = _to_float(val)
-                                if fv:
-                                    return fv
-                            fv = _to_float(v)
-                            if fv:
-                                return fv
-                    for v in o.values():
-                        r = scan(v)
-                        if r:
-                            return r
-                elif isinstance(o, list):
-                    for it in o:
-                        r = scan(it)
-                        if r:
-                            return r
-                return None
-
-            return scan(obj)
-    except Exception:
+def _infer_is_sale(url: str | None) -> bool | None:
+    if not url:
         return None
+    u = str(url)
+    if "/for-sale/" in u:
+        return True
+    if "/for-rent/" in u or "/for-rent" in u:
+        return False
     return None
 
-def _likely_area_col(name: str) -> bool:
-    ln = name.lower()
-    return any(h in ln for h in _AREA_NAME_HINTS)
+# --------- core normalize ----------
+def normalize(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
 
-def _best_surface(df: pd.DataFrame) -> pd.Series:
-    n = len(df)
-    base = pd.Series([np.nan] * n, index=df.index, dtype="float64")
+    # Ensure expected columns exist
+    for c in ["price", "surface_m2", "price_per_m2", "postal_code", "url", "city",
+              "property_type", "title", "bedrooms", "bathrooms", "year_built", "snapshot_date", "is_sale"]:
+        if c not in out.columns:
+            out[c] = pd.Series([None] * len(out))
 
-    # 1) any column whose name hints at area/surface
-    direct_candidates = []
-    for col in df.columns:
-        if _likely_area_col(col):
-            series = pd.to_numeric(df[col].apply(_to_float), errors="coerce")
-            direct_candidates.append(series)
-    if direct_candidates:
-        stacked = pd.concat(direct_candidates, axis=1)
-        base = stacked.bfill(axis=1).iloc[:, 0]
+    # snapshot_date to date
+    sd = out.get("snapshot_date")
+    if sd is None or sd.isna().all():
+        out["snapshot_date"] = date.today()
+    else:
+        out["snapshot_date"] = pd.to_datetime(sd, errors="coerce").dt.date.fillna(date.today())
 
-    # 2) regex across ALL object columns (no applymap deprecation)
-    obj_cols = [c for c in df.columns if df[c].dtype == "object"]
-    if obj_cols:
-        rg = pd.DataFrame(
-            {c: df[c].map(_search_m2_in_text) for c in obj_cols},
-            index=df.index
-        )
-        rg_first = rg.apply(lambda r: next((v for v in r.values if v is not None), np.nan), axis=1)
-        base = base.fillna(pd.to_numeric(rg_first, errors="coerce"))
+    # surface_m2: range mid or number
+    s_candidates = ["surface_m2", "surface", "area", "area_m2", "surface (m²)", "surface_m²"]
+    surf = out[s_candidates].bfill(axis=1).iloc[:, 0] if any(c in out.columns for c in s_candidates) else out["surface_m2"]
+    surf = surf.apply(lambda v: _mid_from_range(v) if isinstance(v, str) and re.search(r"\d+\s*[–\-to]+\s*\d+", v) else _to_float(v))
+    out["surface_m2"] = surf
 
-    # 3) JSON-ish blobs
-    for c in obj_cols:
-        col_vals = df[c]
-        if not col_vals.astype(str).str.contains("{").any():
-            continue
-        json_guess = col_vals.map(lambda s: _extract_surface_from_jsonish(str(s)))
-        base = base.fillna(pd.to_numeric(json_guess, errors="coerce"))
+    # price: first numeric token (accept comma decimal), guard against k€ mis-unit
+    p_candidates = ["price", "price_eur", "price_text", "price_amount"]
+    price_raw = out[p_candidates].bfill(axis=1).iloc[:, 0] if any(c in out.columns for c in p_candidates) else out["price"]
+    price = price_raw.apply(_to_float)
 
-    return base
+    # if some rows look like "315" but others go to millions, keep as-is; k€->€ guard is in training_clean.
+    out["price"] = price
 
-# -------------------------------------------------------------------
-# Price extraction (robust)
-# -------------------------------------------------------------------
+    # bedrooms / bathrooms ints
+    for col in ["bedrooms", "bathrooms", "year_built", "postal_code"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
 
-_PRICE_NAME_HINTS = ["price", "prijs", "prix", "amount", "value", "amount_eur", "asking", "kost", "kosten", "rent", "huur"]
+    # is_sale inference from URL if missing
+    if "is_sale" not in out.columns or out["is_sale"].isna().any():
+        out["is_sale"] = out["is_sale"]
+        out.loc[out["is_sale"].isna(), "is_sale"] = out["url"].apply(_infer_is_sale)
 
-def _likely_price_col(name: str) -> bool:
-    ln = name.lower()
-    return any(h in ln for h in _PRICE_NAME_HINTS)
+    # price_per_m2 (compute if possible)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ppm2 = out["price"] / out["surface_m2"]
+        ppm2 = ppm2.replace([np.inf, -np.inf], np.nan)
+    out["price_per_m2"] = out.get("price_per_m2").where(lambda s: s.notna(), ppm2)
 
-def _best_price(df: pd.DataFrame) -> pd.Series:
-    n = len(df)
-    base = pd.Series([np.nan] * n, index=df.index, dtype="float64")
+    # dedupe by URL
+    if "url" in out.columns:
+        before = len(out)
+        out = out.drop_duplicates(subset=["url"], keep="first")
+        _log(f"normalize(): dropped {before - len(out)} duplicate URLs")
 
-    # 1) numeric from price-like columns
-    direct_candidates = []
-    for col in df.columns:
-        if _likely_price_col(col):
-            # try text parse first, then numeric
-            col_series = df[col]
-            parsed = col_series.map(_parse_money_like)
-            num = pd.to_numeric(col_series, errors="coerce")
-            combined = parsed.fillna(num)
-            direct_candidates.append(combined)
-    if direct_candidates:
-        stacked = pd.concat(direct_candidates, axis=1)
-        base = stacked.bfill(axis=1).iloc[:, 0]
-
-    # 2) scan title/description first
-    text_first = []
-    for cand in ("title", "description", "desc", "summary"):
-        if cand in df.columns:
-            text_first.append(df[cand].map(_parse_money_like))
-    if text_first:
-        stacked = pd.concat(text_first, axis=1)
-        base = base.fillna(stacked.bfill(axis=1).iloc[:, 0])
-
-    # 3) last resort: scan all object cols for money-like
-    obj_cols = [c for c in df.columns if df[c].dtype == "object"]
-    if obj_cols:
-        scan_all = pd.DataFrame({c: df[c].map(_parse_money_like) for c in obj_cols}, index=df.index)
-        fallback = scan_all.bfill(axis=1).iloc[:, 0]
-        base = base.fillna(fallback)
-
-    # scale if obviously k€
-    base = _round_price_if_k(base)
-    return pd.to_numeric(base, errors="coerce")
-
-# -------------------------------------------------------------------
-# Normalization
-# -------------------------------------------------------------------
+    return out
 
 @dataclass
-class Normalized:
-    url: str
-    title: Optional[str]
-    city: Optional[str]
-    postal_code: Optional[str]
-    property_type: Optional[str]
-    price: Optional[float]
-    surface_m2: Optional[float]
-    bedrooms: Optional[int]
-    bathrooms: Optional[int]
-    year_built: Optional[int]
-    energy_label: Optional[str]
-    is_sale: Optional[bool]
-    snapshot_date: date
+class SanitySummary:
+    when: str
+    total_in: int
+    total_out: int
+    dropped_duplicates: int
+    dropped_bad_price_for_sale: int
+    dropped_surface_outlier: int
+    dropped_ppm2_outlier: int
+    dropped_null_key: int
 
-_KEEP_COLS = [
-    "snapshot_date",
-    "url", "title", "city", "postal_code", "region",
-    "property_type", "price", "surface_m2",
-    "bedrooms", "bathrooms", "year_built", "energy_label",
-    "is_sale",
-]
+def sanity_filter(df: pd.DataFrame) -> tuple[pd.DataFrame, SanitySummary]:
+    total_in = len(df)
+    before = total_in
 
-def _first_present_series(df: pd.DataFrame, names: list[str]) -> pd.Series:
-    for n in names:
-        if n in df.columns:
-            return df[n]
-    return pd.Series([None] * len(df), index=df.index)
+    # 1) required keys to be even remotely useful
+    req = ["url", "price", "city", "postal_code"]
+    null_mask = pd.Series(False, index=df.index)
+    for c in req:
+        if c in df.columns:
+            null_mask |= df[c].isna()
+    df1 = df[~null_mask].copy()
+    dropped_null = before - len(df1); before = len(df1)
 
-def normalize(df: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame(index=df.index)
+    # 2) drop blatantly wrong SALE prices (e.g., 1030€ looks like rent)
+    # Keep rents; only apply guard where we know it's a sale
+    sale_mask = df1["is_sale"] == True
+    bad_sale_price = sale_mask & df1["price"].between(0, 10000, inclusive="both")
+    df2 = df1[~bad_sale_price].copy()
+    dropped_bad_sale = before - len(df2); before = len(df2)
 
-    # snapshot_date (vectorized; broadcast when missing)
-    if "snapshot_date" in df.columns:
-        sd = pd.to_datetime(df["snapshot_date"], errors="coerce")
-        # sd can be a scalar Timestamp in some edge-cases; handle both
-        if isinstance(sd, pd.Series):
-            out["snapshot_date"] = sd.dt.date
-        else:
-            out["snapshot_date"] = pd.Series([sd.date() if hasattr(sd, "date") else date.today()] * len(df), index=df.index)
-    else:
-        out["snapshot_date"] = pd.Series([date.today()] * len(df), index=df.index)
+    # 3) surface outliers (residential bounds)
+    # keep None for surface if unknown; only drop if present and absurd
+    surf = df2["surface_m2"]
+    surf_bad = surf.notna() & ((surf < 8) | (surf > 1000))
+    df3 = df2[~surf_bad].copy()
+    dropped_surf = before - len(df3); before = len(df3)
 
-    # url
-    url = _first_present_series(df, ["url", "link", "href"])
-    out["url"] = url.astype(str)
+    # 4) price-per-m2 sanity (if both present)
+    ppm2 = df3["price_per_m2"]
+    ppm2_bad = ppm2.notna() & ((ppm2 < 500) | (ppm2 > 20000))
+    df4 = df3[~ppm2_bad].copy()
+    dropped_ppm2 = before - len(df4); before = len(df4)
 
-    # strings
-    out["title"]        = _first_present_series(df, ["title", "headline"])
-    out["city"]         = _first_present_series(df, ["city", "locality", "address_city"])
-    out["postal_code"]  = _first_present_series(df, ["postal_code", "postcode", "zip", "zip_code"])
-    out["property_type"]= _first_present_series(df, ["property_type", "type", "category"])
-    out["energy_label"] = _first_present_series(df, ["energy_label", "epc"])
+    # recompute ppm2 safely post-filter (might have lost surf/price)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        df4["price_per_m2"] = (df4["price"] / df4["surface_m2"]).replace([np.inf, -np.inf], np.nan)
 
-    # numeric-ish
-    out["bedrooms"]    = pd.to_numeric(df.get("bedrooms"), errors="coerce").round().astype("Int64")
-    out["bathrooms"]   = pd.to_numeric(df.get("bathrooms"), errors="coerce").round().astype("Int64")
-    out["year_built"]  = pd.to_numeric(df.get("year_built"), errors="coerce").round().astype("Int64")
+    summary = SanitySummary(
+        when=datetime.now().isoformat(timespec="seconds"),
+        total_in=total_in,
+        total_out=len(df4),
+        dropped_duplicates=0,  # handled earlier in normalize()
+        dropped_bad_price_for_sale=int(dropped_bad_sale),
+        dropped_surface_outlier=int(dropped_surf),
+        dropped_ppm2_outlier=int(dropped_ppm2),
+        dropped_null_key=int(dropped_null),
+    )
+    return df4, summary
 
-    # robust price + surface
-    out["price"]      = _best_price(df)
-    out["surface_m2"] = _best_surface(df)
-
-    # is_sale
-    if "is_sale" in df.columns:
-        s = df["is_sale"].astype(str).str.lower().map({"true": True, "1": True, "false": False, "0": False})
-        out["is_sale"] = s.fillna(df["is_sale"])
-    else:
-        u = out["url"].astype(str).str.lower()
-        out["is_sale"] = u.str.contains("for-sale|te-koop|a-vendre|zu-verkaufen", regex=True)
-
-    # region from postal
-    out["postal_code"] = out["postal_code"].where(out["postal_code"].notna(), None)
-    out["region"] = out["postal_code"].apply(postal_to_region)
-
-    # casts
-    out["price"] = pd.to_numeric(out["price"], errors="coerce")
-    out["surface_m2"] = pd.to_numeric(out["surface_m2"], errors="coerce")
-
-    # small diagnostics
-    filled_s = int(out["surface_m2"].notna().sum())
-    filled_p = int(out["price"].notna().sum())
-    logger.info("normalize(): price filled: %d / %d | surface_m2 filled: %d / %d", filled_p, len(out), filled_s, len(out))
-
-    return out[_KEEP_COLS]
-
-# -------------------------------------------------------------------
-# DuckDB: schema & upserts
-# -------------------------------------------------------------------
-
-_SCHEMA_LATEST = """
-snapshot_date DATE,
-url TEXT,
-title TEXT,
-city TEXT,
-postal_code VARCHAR,
-region VARCHAR,
-property_type TEXT,
-price DOUBLE,
-surface_m2 DOUBLE,
-bedrooms INTEGER,
-bathrooms INTEGER,
-year_built INTEGER,
-energy_label VARCHAR,
-is_sale BOOLEAN
-"""
-
-_SCHEMA_HISTORY = _SCHEMA_LATEST
-
-_SCHEMA_SUMMARY = """
-snapshot_date DATE,
-city TEXT,
-property_type TEXT,
-n INT,
-median_price DOUBLE,
-median_surface_m2 DOUBLE,
-median_price_per_m2 DOUBLE
-"""
-
-def _migrate_schema(con: duckdb.DuckDBPyConnection) -> None:
-    # Create if missing; if extra columns already exist, we'll target insert columns explicitly.
-    con.execute(f"CREATE TABLE IF NOT EXISTS listings_latest   ({_SCHEMA_LATEST})")
-    con.execute(f"CREATE TABLE IF NOT EXISTS listings_history  ({_SCHEMA_HISTORY})")
-    con.execute(f"CREATE TABLE IF NOT EXISTS market_daily_summary ({_SCHEMA_SUMMARY})")
-
-_INSERT_COLS = (
-    "snapshot_date, url, title, city, postal_code, region, property_type, "
-    "price, surface_m2, bedrooms, bathrooms, year_built, energy_label, is_sale"
-)
-
-def _upsert_with_retry(df: pd.DataFrame, db_path: str) -> None:
-    con = duckdb.connect(db_path)
+# --------- DuckDB upsert ----------
+def _ensure_duckdb() -> None:
+    DUCKDB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(DUCKDB_PATH)
     try:
-        _migrate_schema(con)
-        con.register("df", df)
-
-        # refresh today's snapshot in listings_latest
-        day = df["snapshot_date"].iloc[0]
-        con.execute("DELETE FROM listings_latest WHERE snapshot_date = ?", [day])
-        con.execute(f"""
-            INSERT INTO listings_latest ({_INSERT_COLS})
-            SELECT {_INSERT_COLS} FROM df
-        """)
-
-        # append to history
-        con.execute(f"""
-            INSERT INTO listings_history ({_INSERT_COLS})
-            SELECT {_INSERT_COLS} FROM df
-        """)
-
-        # recompute daily summary (replace table atomically)
         con.execute("""
-            CREATE OR REPLACE TABLE market_daily_summary AS
-            WITH base AS (
-                SELECT
-                    snapshot_date,
-                    city,
-                    property_type,
-                    price,
-                    surface_m2,
-                    CASE WHEN surface_m2 > 0 AND price > 0 THEN price / surface_m2 END AS price_per_m2
-                FROM listings_history
-            )
-            SELECT
-                snapshot_date,
-                city,
-                property_type,
-                COUNT(*) AS n,
-                median(price) AS median_price,
-                median(surface_m2) AS median_surface_m2,
-                median(price_per_m2) AS median_price_per_m2
-            FROM base
-            GROUP BY 1,2,3
+        CREATE TABLE IF NOT EXISTS listings_latest (
+            snapshot_date DATE,
+            city TEXT,
+            postal_code INTEGER,
+            property_type TEXT,
+            price DOUBLE,
+            price_per_m2 DOUBLE,
+            surface_m2 DOUBLE,
+            bedrooms INTEGER,
+            bathrooms INTEGER,
+            energy_label TEXT,
+            is_sale BOOLEAN,
+            url TEXT,
+            title TEXT,
+            year_built INTEGER
+        );
+        """)
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS listings_history AS
+        SELECT * FROM listings_latest WHERE 1=0;
+        """)
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS market_daily_summary (
+            snapshot_date DATE,
+            city TEXT,
+            property_type TEXT,
+            n INTEGER,
+            median_price DOUBLE,
+            median_surface_m2 DOUBLE,
+            median_price_per_m2 DOUBLE
+        );
         """)
     finally:
         con.close()
 
-# -------------------------------------------------------------------
-# Load sources & entry point
-# -------------------------------------------------------------------
+def upsert_duckdb(df: pd.DataFrame) -> None:
+    _ensure_duckdb()
+    con = duckdb.connect(DUCKDB_PATH)
+    try:
+        # replace latest in full (idempotent daily snapshot)
+        con.execute("DELETE FROM listings_latest;")
+        con.register("tmp_df", df)
+        con.execute("""
+            INSERT INTO listings_latest
+            SELECT snapshot_date, city, postal_code, property_type, price, price_per_m2, surface_m2,
+                   bedrooms, bathrooms, energy_label, is_sale, url, title, year_built
+            FROM tmp_df
+        """)
+        # append to history
+        con.execute("""
+            INSERT INTO listings_history
+            SELECT * FROM listings_latest
+        """)
+        # small summary table
+        con.execute("DELETE FROM market_daily_summary WHERE snapshot_date IN (SELECT DISTINCT snapshot_date FROM listings_latest);")
+        con.execute("""
+            INSERT INTO market_daily_summary
+            SELECT
+              snapshot_date,
+              city,
+              property_type,
+              COUNT(*) as n,
+              MEDIAN(price) as median_price,
+              MEDIAN(surface_m2) as median_surface_m2,
+              MEDIAN(price_per_m2) as median_price_per_m2
+            FROM listings_latest
+            GROUP BY snapshot_date, city, property_type
+        """)
+    finally:
+        con.close()
 
-def _load_latest_compacted_details(kind: str) -> Optional[pd.DataFrame]:
-    today = date.today()
-    today_path = Path(f"data/raw/{today:%Y/%m/%d}/{kind}_details.parquet")
-    if today_path.exists():
-        return pd.read_parquet(today_path)
-    base = Path("data/raw")
-    if not base.exists():
-        return None
-    files = sorted(base.rglob(f"{kind}_details.parquet"))
-    if files:
-        return pd.read_parquet(files[-1])
-    return None
-
-def run() -> Optional[str]:
-    dfs: List[pd.DataFrame] = []
+# --------- IO helpers ----------
+def _read_compacted() -> pd.DataFrame:
+    # your details_compact step writes one parquet per kind; read both if present
+    parts: List[pd.DataFrame] = []
     for kind in ("apartments", "houses"):
-        raw = _load_latest_compacted_details(kind)
-        if raw is None or raw.empty:
-            continue
-        nn = normalize(raw)
-        dfs.append(nn)
+        # latest compact parquet path convention:
+        # data/processed/analysis/YYYY-MM-DD/{kind}.parquet OR interim/...
+        # use a broad glob:
+        for root in (AN_PROC_DIR, AN_RAW_DIR, DATA_ROOT):
+            gl = sorted(root.glob(f"**/{kind}.parquet"))
+            if gl:
+                parts.append(pd.read_parquet(gl[-1]))
+                break
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
-    if not dfs:
-        logger.warning("No compacted details found; nothing to normalize.")
-        return None
+# --------- main ----------
+def run() -> str:
+    df_raw = _read_compacted()
+    if df_raw.empty:
+        _log("No compacted inputs found; nothing to do.")
+        return str(AN_PROC_DIR)
 
-    df = pd.concat(dfs, ignore_index=True)
+    _log(f"normalize(): starting with {len(df_raw)} rows")
+    df_norm = normalize(df_raw)
 
-    # helper column (not part of DuckDB tables)
-    df_out = df.copy()
-    df_out["price_per_m2"] = np.where(
-        (df_out["price"] > 0) & (df_out["surface_m2"] > 0),
-        df_out["price"] / df_out["surface_m2"],
-        np.nan,
-    )
+    df_clean, summ = sanity_filter(df_norm)
+    _log(f"sanity_filter(): kept {summ.total_out} / {summ.total_in} rows")
 
-    out = _processed_analysis_out()
-    df_out.to_parquet(out, index=False)
+    # persist parquet (date-partition)
+    day_dir = AN_PROC_DIR / str(date.today())
+    day_dir.mkdir(parents=True, exist_ok=True)
+    out_parquet = day_dir / "listings.parquet"
+    df_clean.to_parquet(out_parquet, index=False)
+    _log(f"{out_parquet}")
 
-    logger.info("📚 Wrote analytics into %s", Path(_analytics_db_path()).resolve())
-    logger.info(str(out))
+    # save sanity summary json for UI footer
+    (day_dir / "sanity_summary.json").write_text(json.dumps(summ.__dict__, indent=2))
 
-    _upsert_with_retry(df, _analytics_db_path())
-    return str(out)
+    # duckdb upsert
+    upsert_duckdb(df_clean)
+    _log(f"📚 Wrote analytics into {DUCKDB_PATH}")
+
+    return str(out_parquet)
 
 if __name__ == "__main__":
     print(run())
