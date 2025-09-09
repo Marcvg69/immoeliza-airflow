@@ -1,107 +1,202 @@
-# src/immoeliza/modeling/train_regression.py
+"""
+Train baseline models on the processed training parquet.
+
+- Reads a single training parquet path (argument: training_parquet)
+- Builds a preprocessing pipeline (num median-impute + scale, cat one-hot)
+- Auto-drops numeric features that are entirely NaN to avoid imputer warnings
+- Trains LinearRegression (log-price) and RandomForestRegressor; saves best model
+- Returns paths + metrics dict
+
+Public API:
+    train(training_parquet: str) -> dict
+"""
+
 from __future__ import annotations
-from datetime import datetime
+
+import json
+import logging
 from pathlib import Path
-import hashlib, json
+from datetime import datetime
+from typing import Dict, List
+
 import numpy as np
 import pandas as pd
+from joblib import dump
+
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import r2_score, mean_absolute_error, mean_absolute_percentage_error, mean_squared_error
-import joblib
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
 
-from immoeliza.scraping.common import logger
+# ---------- logger ---------- #
+logger = logging.getLogger("immoeliza.scraping")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
-NUM = ["surface_m2","bedrooms","bathrooms","year_built","price_per_m2"]
-CAT = ["postal_code","city","property_type","energy_label","region"]
+# ---------- helpers ---------- #
 
-def _md5(path: str) -> str:
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def _rmse(y_true, y_pred) -> float:
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2))) if len(y_true) else float("nan")
 
-def _preprocess():
-    return ColumnTransformer([
-        ("num", Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-        ]), NUM),
-        ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), CAT),
-    ])
+def _mae(y_true, y_pred) -> float:
+    return float(np.mean(np.abs(y_true - y_pred))) if len(y_true) else float("nan")
 
-def _rmse(y_true, y_pred): return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+def _mape(y_true, y_pred) -> float:
+    # only compute where y_true > 0 to avoid div-by-zero
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    mask = y_true > 0
+    if mask.sum() == 0:
+        return float("nan")
+    return float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])))
 
-def train(training_parquet: str) -> dict:
-    df = pd.read_parquet(training_parquet)
-    if len(df) == 0:
+def _now_tag() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# ---------- main ---------- #
+
+def train(training_parquet: str) -> Dict:
+    p = Path(training_parquet)
+    if not p.exists():
+        raise FileNotFoundError(f"Training parquet not found: {p}")
+
+    df = pd.read_parquet(p)
+    if df.empty:
         raise ValueError(f"Training file has 0 rows: {training_parquet}")
 
-    y = df["price"].values.astype(float)
-    X = df.drop(columns=["price"])
+    # Expected columns
+    target_col = "price"
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    base_num_cols = ["surface_m2", "price_per_m2", "bedrooms", "bathrooms", "year_built"]
+    base_cat_cols = ["postal_code", "city", "region", "property_type", "energy_label"]
 
-    prep = _preprocess()
+    # Keep only columns that exist
+    present_num_cols = [c for c in base_num_cols if c in df.columns]
+    present_cat_cols = [c for c in base_cat_cols if c in df.columns]
 
-    # Baseline: LinearRegression on log(price), evaluate on original scale
-    lin = Pipeline([("prep", prep), ("reg", LinearRegression())])
+    # Drop numeric columns that are entirely NaN (avoid imputer warnings & silent drops)
+    nonempty_num_cols = [c for c in present_num_cols if pd.to_numeric(df[c], errors="coerce").notna().any()]
+    dropped_num_cols = sorted(list(set(present_num_cols) - set(nonempty_num_cols)))
+
+    if dropped_num_cols:
+        logger.warning("Dropping numeric features with all-missing values: %s", dropped_num_cols)
+
+    # Final feature lists
+    num_cols: List[str] = nonempty_num_cols
+    cat_cols: List[str] = present_cat_cols
+
+    # Minimal safety: if *all* numeric ended up dropped, keep none; model can still run on cats.
+    if len(num_cols) == 0 and len(cat_cols) == 0:
+        raise ValueError("No usable features available after filtering.")
+
+    # Split
+    X = df[num_cols + cat_cols].copy()
+    y = pd.to_numeric(df[target_col], errors="coerce")
+    keep = y.notna()
+    X, y = X.loc[keep], y.loc[keep]
+
+    if len(X) < 6:
+        logger.warning("Very small dataset (%d rows) — metrics will be unstable.", len(X))
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=max(1, int(len(X) * 0.2)), random_state=42)
+
+    # Pipelines
+    num_pipe = Pipeline([
+        ("cast", SimpleImputer(strategy="median")),   # impute
+        ("scale", StandardScaler(with_mean=False)),   # sparse-friendly
+    ])
+
+    # Use new OneHotEncoder kw (sparse_output) for recent sklearn; falls back if older
+    try:
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+    except TypeError:
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse=True)
+
+    cat_pipe = Pipeline([
+        ("impute", SimpleImputer(strategy="constant", fill_value="Unknown")),
+        ("ohe", ohe),
+    ])
+
+    transformers = []
+    if len(num_cols):
+        transformers.append(("num", num_pipe, num_cols))
+    if len(cat_cols):
+        transformers.append(("cat", cat_pipe, cat_cols))
+
+    pre = ColumnTransformer(transformers=transformers, remainder="drop")
+
+    # Models
+    lin = Pipeline([("pre", pre), ("lin", LinearRegression())])
+    rf = Pipeline([("pre", pre),
+                   ("rf", RandomForestRegressor(
+                        n_estimators=300,
+                        max_depth=None,
+                        min_samples_split=2,
+                        min_samples_leaf=1,
+                        random_state=42,
+                   ))])
+
+    # Fit on log-price; evaluate in original scale
     lin.fit(X_train, np.log1p(y_train))
-    y_pred_lin = np.expm1(lin.predict(X_test))
+    rf.fit(X_train, np.log1p(y_train))
 
-    # RandomForest
-    rf = Pipeline([("prep", prep), ("reg", RandomForestRegressor(
-        n_estimators=300, random_state=42, n_jobs=-1, min_samples_leaf=2
-    ))])
-    rf.fit(X_train, y_train)
-    y_pred_rf = rf.predict(X_test)
+    def predict_to_euros(model, X):
+        return np.expm1(model.predict(X))
 
-    metrics = {
-        "linear": {
-            "rmse": _rmse(y_test, y_pred_lin),
-            "mae":  float(mean_absolute_error(y_test, y_pred_lin)),
-            "mape": float(mean_absolute_percentage_error(y_test, y_pred_lin)),
-            "r2":   float(r2_score(y_test, y_pred_lin)),
-        },
-        "rf": {
-            "rmse": _rmse(y_test, y_pred_rf),
-            "mae":  float(mean_absolute_error(y_test, y_pred_rf)),
-            "mape": float(mean_absolute_percentage_error(y_test, y_pred_rf)),
-            "r2":   float(r2_score(y_test, y_pred_rf)),
-        },
+    preds_lin = predict_to_euros(lin, X_test)
+    preds_rf  = predict_to_euros(rf,  X_test)
+
+    m_lin = {
+        "rmse": _rmse(y_test.values, preds_lin),
+        "mae":  _mae(y_test.values, preds_lin),
+        "mape": _mape(y_test.values, preds_lin),
+        "r2":   float(np.corrcoef(y_test.values, preds_lin)[0,1]**2) if len(y_test) >= 2 else float("nan"),
+    }
+    m_rf = {
+        "rmse": _rmse(y_test.values, preds_rf),
+        "mae":  _mae(y_test.values, preds_rf),
+        "mape": _mape(y_test.values, preds_rf),
+        "r2":   float(np.corrcoef(y_test.values, preds_rf)[0,1]**2) if len(y_test) >= 2 else float("nan"),
+    }
+
+    # Pick best by RMSE (lower is better)
+    best_name, best_model, best_metrics = ("linear", lin, m_lin) if m_lin["rmse"] <= m_rf["rmse"] else ("rf", rf, m_rf)
+
+    tag = _now_tag()
+    models_dir = Path("models")
+    models_dir.mkdir(parents=True, exist_ok=True)
+    model_path = models_dir / f"{best_name}_price_{tag}.joblib"
+    dump(best_model, model_path)
+
+    metadata = {
+        "created_at": datetime.now().isoformat(),
+        "training_parquet": str(p),
+        "n_rows_total": int(len(df)),
+        "n_rows_used": int(len(X)),
         "n_train": int(len(X_train)),
-        "n_test":  int(len(X_test)),
+        "n_test": int(len(X_test)),
+        "features": {
+            "numeric_used": num_cols,
+            "categorical_used": cat_cols,
+            "numeric_dropped_all_missing": dropped_num_cols,
+        },
+        "metrics": {"linear": m_lin, "rf": m_rf, "chosen": best_name},
     }
-
-    # pick best by RMSE
-    best_name = "linear" if metrics["linear"]["rmse"] <= metrics["rf"]["rmse"] else "rf"
-    best = lin if best_name == "linear" else rf
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    models_dir = Path("models"); models_dir.mkdir(exist_ok=True)
-    model_path = models_dir / (f"{'lin' if best_name=='linear' else 'rf'}_price_{ts}.joblib")
-    joblib.dump(best, model_path)
-
-    meta = {
-        "timestamp": ts,
-        "training_file": training_parquet,
-        "training_md5": _md5(training_parquet),
-        "features_num": NUM,
-        "features_cat": CAT,
-        "metrics": metrics,
-        "best_model": best_name,
-        "model_path": str(model_path),
-    }
-    meta_path = models_dir / f"metadata_{ts}.json"
-    meta_path.write_text(json.dumps(meta, indent=2))
+    meta_path = models_dir / f"metadata_{tag}.json"
+    meta_path.write_text(json.dumps(metadata, indent=2))
 
     logger.info("🤖 Model saved -> %s", model_path)
-    logger.info("📊 Metrics: %s", metrics)
+    logger.info("📊 Metrics: %s", metadata["metrics"])
     logger.info("🧾 Metadata -> %s", meta_path)
-    return {"model_path": str(model_path), "metadata_path": str(meta_path), "metrics": metrics}
+
+    return {
+        "model_path": str(model_path),
+        "metadata_path": str(meta_path),
+        "metrics": metadata["metrics"],
+    }
+
+
+__all__ = ["train"]
