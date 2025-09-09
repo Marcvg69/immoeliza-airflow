@@ -1,130 +1,171 @@
-# airflow/dags/immoeliza_pipeline_dag.py
-from __future__ import annotations
-import os, sys
-from pathlib import Path
-from datetime import datetime, timedelta
+"""
+Airflow DAG: ImmoEliza end-to-end
 
-# Make our package importable inside Airflow workers
-SRC = Path(__file__).resolve().parents[2] / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+Pipeline:
+  1) URL scraping (apartments, houses)
+  2) Consolidate URLs per kind
+  3) Fetch details per kind
+  4) Compact details (parquet) per kind
+  5) Analytics cleaning -> analytics.duckdb + processed parquet
+  6) Training cleaning -> processed training parquet
+  7) Dual-target training:
+       - price
+       - price_per_m2 (if available; otherwise no-op)
+Notes:
+- Tasks return important artifact paths via XCom.
+- Env knobs:
+    IMMO_HEADLESS       -> "true"/"false" (used by the detail scraper underneath)
+    IMMO_MAX_PAGES      -> number of search pages per town (default 1)
+    IMMO_DETAILS_LIMIT  -> cap details per run (default None)
+    IMMO_ANALYTICS_DB   -> path to DuckDB (default analytics/immoeliza.duckdb)
+"""
+
+from __future__ import annotations
+
+import os
+import pendulum
+from datetime import timedelta
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-# --- task callables (thin wrappers that live under airflow/dags/tasks) ---
-from tasks.scrape_apartments import run as t_scrape_apartments
-from tasks.scrape_houses import run as t_scrape_houses
-from tasks.store_raw import run as t_store_raw
-from tasks.fetch_details import run as t_fetch_details
-from tasks.compact_details import run as t_compact_details
-from tasks.clean_for_analysis import run as t_clean_for_analysis
-from tasks.clean_for_training import run as t_clean_for_training
-from tasks.train_regression import run as t_train_regression
-from tasks.save_analytics import run as t_save_analytics
-from tasks.save_model import run as t_save_model
-from tasks.notify import run as t_notify
+# --------- Thin wrappers so operators have stable callables ---------
 
-default_args = {
-    "owner": "immo",
-    "depends_on_past": False,
-    "retries": 1,
-    "retry_delay": timedelta(minutes=5),
-}
+def _scrape_apartments(**_):
+    max_pages = int(os.getenv("IMMO_MAX_PAGES", "1"))
+    from immoeliza.scraping.apartments import run as run_apts
+    return run_apts(max_pages=max_pages)
+
+def _scrape_houses(**_):
+    max_pages = int(os.getenv("IMMO_MAX_PAGES", "1"))
+    from immoeliza.scraping.houses import run as run_houses
+    return run_houses(max_pages=max_pages)
+
+def _consolidate(kind: str, **_):
+    from immoeliza.scraping.consolidate import consolidate_urls
+    return consolidate_urls(kind)
+
+def _fetch_details(kind: str, **_):
+    # Limit comes from env (string or empty)
+    lim_raw = os.getenv("IMMO_DETAILS_LIMIT", "").strip()
+    limit = int(lim_raw) if lim_raw.isdigit() else None
+    from immoeliza.scraping.details import run as run_details
+    return run_details(kind, limit=limit)
+
+def _compact_details(kind: str, **_):
+    from immoeliza.scraping.details_compact import compact
+    return compact(kind)
+
+def _clean_analysis(**_):
+    from immoeliza.cleaning.analysis_clean import run as run_analysis
+    return run_analysis()
+
+def _clean_training(**_):
+    from immoeliza.cleaning.training_clean import run as run_training
+    return run_training()
+
+def _train_price(ti, **_):
+    """Train model to predict absolute price (EUR), leak-safe."""
+    from immoeliza.modeling.train_regression import train
+    training_file = ti.xcom_pull(task_ids="clean_training")
+    # prefer explicit env override, else call as 'price'
+    target = os.getenv("IMMO_TRAIN_TARGET", "price")
+    return train(training_file, target=target)
+
+def _train_price_per_m2(ti, **_):
+    """Train model to predict price_per_m2 if that column exists and is usable."""
+    from immoeliza.modeling.train_regression import train
+    training_file = ti.xcom_pull(task_ids="clean_training")
+    return train(training_file, target="price_per_m2")
+
+# --------- DAG definition ---------
 
 with DAG(
     dag_id="immoeliza_pipeline",
-    description="Immo-Eliza end-to-end ETL + model",
-    start_date=datetime(2025, 9, 1),
-    schedule_interval="0 3 * * *",  # daily @ 03:00
+    start_date=pendulum.datetime(2024, 1, 1, tz="Europe/Brussels"),
+    schedule="0 6 * * *",  # daily at 06:00
     catchup=False,
-    default_args=default_args,
     max_active_runs=1,
-    tags=["immoeliza"],
+    default_args={
+        "owner": "immoeliza",
+        "retries": 1,
+        "retry_delay": timedelta(minutes=5),
+    },
+    tags=["immo", "scraping", "etl", "ml"],
 ) as dag:
 
-    # --- 1) URL scraping per kind ---
+    # 1) URL scraping
     scrape_apartments = PythonOperator(
         task_id="scrape_apartments",
-        python_callable=t_scrape_apartments,
+        python_callable=_scrape_apartments,
     )
     scrape_houses = PythonOperator(
         task_id="scrape_houses",
-        python_callable=t_scrape_houses,
+        python_callable=_scrape_houses,
     )
 
-    # --- 2) Consolidate URLs to daily parquet ---
-    store_raw_apartments = PythonOperator(
-        task_id="store_raw_apartments",
-        python_callable=t_store_raw,
+    # 2) Consolidate
+    consolidate_apartments = PythonOperator(
+        task_id="consolidate_apartments",
+        python_callable=_consolidate,
         op_kwargs={"kind": "apartments"},
     )
-    store_raw_houses = PythonOperator(
-        task_id="store_raw_houses",
-        python_callable=t_store_raw,
+    consolidate_houses = PythonOperator(
+        task_id="consolidate_houses",
+        python_callable=_consolidate,
         op_kwargs={"kind": "houses"},
     )
 
-    # --- 3) Fetch details from consolidated URLs ---
+    # 3) Fetch details
     fetch_details_apartments = PythonOperator(
         task_id="fetch_details_apartments",
-        python_callable=t_fetch_details,
-        op_kwargs={"kind": "apartments", "limit": None},  # set limit to small int for smoke tests
+        python_callable=_fetch_details,
+        op_kwargs={"kind": "apartments"},
     )
     fetch_details_houses = PythonOperator(
         task_id="fetch_details_houses",
-        python_callable=t_fetch_details,
-        op_kwargs={"kind": "houses", "limit": None},
+        python_callable=_fetch_details,
+        op_kwargs={"kind": "houses"},
     )
 
-    # --- 4) Compact all detail CSVs to 1 parquet per kind ---
+    # 4) Compact details
     compact_details_apartments = PythonOperator(
         task_id="compact_details_apartments",
-        python_callable=t_compact_details,
+        python_callable=_compact_details,
         op_kwargs={"kind": "apartments"},
     )
     compact_details_houses = PythonOperator(
         task_id="compact_details_houses",
-        python_callable=t_compact_details,
+        python_callable=_compact_details,
         op_kwargs={"kind": "houses"},
     )
 
-    # --- 5) Analytics DuckDB + training parquet ---
-    clean_for_analysis = PythonOperator(
-        task_id="clean_for_analysis",
-        python_callable=t_clean_for_analysis,
-    )
-    clean_for_training = PythonOperator(
-        task_id="clean_for_training",
-        python_callable=t_clean_for_training,
+    # 5) Analytics clean + upsert DuckDB
+    clean_analysis = PythonOperator(
+        task_id="clean_analysis",
+        python_callable=_clean_analysis,
     )
 
-    # --- 6) Train model (saves artifact) ---
-    train_regression = PythonOperator(
-        task_id="train_regression",
-        python_callable=t_train_regression,
-    )
-    save_model = PythonOperator(
-        task_id="save_model",
-        python_callable=t_save_model,   # reads the artifact path or just logs
+    # 6) Training clean
+    clean_training = PythonOperator(
+        task_id="clean_training",
+        python_callable=_clean_training,
     )
 
-    # --- 7) Save analytics + notify ---
-    save_analytics = PythonOperator(
-        task_id="save_analytics",
-        python_callable=t_save_analytics,
+    # 7) Dual-target training (run in parallel after training parquet exists)
+    train_price = PythonOperator(
+        task_id="train_price",
+        python_callable=_train_price,
+        provide_context=True,
     )
-    notify = PythonOperator(
-        task_id="notify",
-        python_callable=t_notify,
-        trigger_rule="all_done",
+    train_price_per_m2 = PythonOperator(
+        task_id="train_price_per_m2",
+        python_callable=_train_price_per_m2,
+        provide_context=True,
     )
 
-    # ---- graph ----
-    scrape_apartments >> store_raw_apartments >> fetch_details_apartments >> compact_details_apartments
-    scrape_houses     >> store_raw_houses     >> fetch_details_houses     >> compact_details_houses
+    # ---- Wiring ----
+    scrape_apartments >> consolidate_apartments >> fetch_details_apartments >> compact_details_apartments
+    scrape_houses     >> consolidate_houses     >> fetch_details_houses     >> compact_details_houses
 
-    [compact_details_apartments, compact_details_houses] >> clean_for_analysis >> save_analytics
-    [compact_details_apartments, compact_details_houses] >> clean_for_training >> train_regression >> save_model
-
-    [save_analytics, save_model] >> notify
+    [compact_details_apartments, compact_details_houses] >> clean_analysis >> clean_training >> [train_price, train_price_per_m2]

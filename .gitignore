@@ -1,78 +1,31 @@
-# -------------------------
-# Python
-# -------------------------
-__pycache__/
-*.py[cod]
-*.so
-.Python
-*.egg-info/
-.eggs/
-build/
-dist/
-pip-wheel-metadata/
-.pytest_cache/
-.mypy_cache/
-.tox/
-coverage.xml
-htmlcov/
-
-# -------------------------
-# Virtual Environments
-# -------------------------
+# venv / python
 .venv/
-venv/
-ENV/
-
-# -------------------------
-# Environment files
-# (keep .env.example in git)
-# -------------------------
-.env
-.env.*
-!.env.example
-
-# -------------------------
-# macOS / Editors
-# -------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.ipynb_checkpoints/
 .DS_Store
-.vscode/
-.idea/
 
-# -------------------------
-# Airflow
-# -------------------------
-airflow/logs/
+# Airflow local state
 airflow/airflow.db
 airflow/airflow.cfg
-airflow/unittests.cfg
-airflow/*.pid
+airflow/logs/
+airflow/standalone_admin.log
 
-# -------------------------
-# Data & Artifacts
-# Keep folder structure via .gitkeep
-# -------------------------
-data/**
-!data/.gitkeep
+# data & analytics (keep processed if you like)
+data/
+data/interim/
+data/tmp/
+analytics/*.duckdb-wal
+analytics/*.duckdb.tmp
 
-analytics/**
-!analytics/.gitkeep
-analytics/*.duckdb
+# models
+models/*.joblib
+models/metadata_*.json
 
-models/**
-!models/.gitkeep
-
-# -------------------------
-# Streamlit / Web UI
-# -------------------------
+# streamlit cache
 .streamlit/
-webui/__pycache__/
-
-# -------------------------
-# Notebooks
-# -------------------------
-.ipynb_checkpoints/
-
-# -------------------------
-# Node (if ever added)
-# -------------------------
+-------------------
 node_modules/
