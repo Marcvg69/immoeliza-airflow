@@ -1,269 +1,247 @@
-"""
-Prepare training data from processed analytics parquet.
-
-Trimming strategies (set via env):
-- IMMO_TRAIN_TRIM=iqr       -> IQR fences per (region, property_type). Default.
-- IMMO_TRAIN_TRIM=middle50  -> Keep Q1..Q3 only (per-bucket).
-- IMMO_TRAIN_TRIM=qcut      -> Keep between IMMO_TRAIN_Q="0.05,0.95" (global).
-- IMMO_TRAIN_MIN_GROUP=20   -> Min rows per bucket before per-bucket stats.
-"""
-
+# immoeliza/cleaning/training_clean.py
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
-import logging
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-LOG = logging.getLogger("immoeliza.scraping")
-if not LOG.handlers:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+log = logging.getLogger("immoeliza.scraping")
+logging.basicConfig(level=os.environ.get("IMMO_LOGLEVEL", "INFO"))
 
+ROOT = Path(".")
+DATA = ROOT / "data"
+PROCESSED = DATA / "processed"
+ANALYSIS_DIR = PROCESSED / "analysis"
+TRAINING_DIR = PROCESSED / "training"
 
-# ---------------------------
-# Helpers
-# ---------------------------
+# --- Surface parsing helpers (used as a last-chance fill) ---------------------
 
-def _latest_processed_analysis_parquet(root: str = "data/processed/analysis") -> Path:
-    rootp = Path(root)
-    if not rootp.exists():
-        raise FileNotFoundError(f"Processed analysis root not found: {root}")
-    # pick latest date subdir that contains listings.parquet
-    candidates = sorted(rootp.glob("*/listings.parquet"))
+SURF_TOKENS = [
+    # French
+    "surface habitable", "surface", "habitable", "superficie",
+    # Dutch
+    "bewoonbare opp.", "bew. opp.", "bewoonbare oppervlakte", "opp.", "oppervlakte", "woonopp",
+    # English-ish
+    "living area", "area",
+    # Misc portal variants
+    "woonoppervlakte", "m²",
+]
+
+SURF_PAT = re.compile(
+    r"(?P<a>\d{1,3}(?:[.,]\d{1,2})?)\s*(?:[-–—]\s*(?P<b>\d{1,3}(?:[.,]\d{1,2})?))?\s*(?:m2|m\u00B2|m²|sqm|m)",
+    flags=re.IGNORECASE,
+)
+
+def _to_float(x) -> Optional[float]:
+    if pd.isna(x):
+        return None
+    if isinstance(x, (int, float, np.number)):
+        v = float(x)
+        return v if np.isfinite(v) else None
+    s = str(x).strip()
+    s = s.replace("\u00A0", " ").replace(" ", "")
+    s = s.replace(",", ".")
+    s = re.sub(r"[^\d.\-–—]", "", s)
+    if not s:
+        return None
+    # handle ranges like 85–90
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)\s*$", s)
+    if m:
+        a, b = float(m.group(1)), float(m.group(2))
+        return (a + b) / 2.0
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+def _extract_surface_any(row: pd.Series) -> Optional[float]:
+    """Best-effort extraction of surface from structured specs or free text."""
+    # 1) direct numeric value in typical fields
+    for k in ("surface_m2", "surface", "living_area"):
+        if k in row and pd.notna(row[k]):
+            v = _to_float(row[k])
+            if v and v > 5:
+                return v
+
+    # 2) dict-like specs/attributes
+    for maybe in ("specs", "attributes", "details"):
+        if maybe in row and pd.notna(row[maybe]) and isinstance(row[maybe], dict):
+            for k, val in row[maybe].items():
+                k_norm = re.sub(r"[^a-z]", "", str(k).lower())
+                if any(tok.replace(" ", "") in k_norm for tok in [t.lower() for t in SURF_TOKENS]):
+                    v = _to_float(val)
+                    if v and v > 5:
+                        return v
+
+    # 3) scan blobs
+    for col in ("title", "description", "raw_html"):
+        if col in row and pd.notna(row[col]):
+            m = SURF_PAT.search(str(row[col]))
+            if m:
+                a = _to_float(m.group("a"))
+                b = _to_float(m.group("b"))
+                pick = b if b else a
+                if pick and pick > 5:
+                    return pick
+    return None
+
+# --- Sources / paths ----------------------------------------------------------
+
+def _latest_analytics_parquet() -> Path:
+    """Pick newest processed analytics parquet: data/processed/analysis/YYYY-MM-DD/listings.parquet."""
+    candidates = sorted(ANALYSIS_DIR.glob("*/listings.parquet"))
     if not candidates:
-        # also try nested date folders
-        candidates = sorted(rootp.glob("*/*/listings.parquet"))
-    if not candidates:
-        raise FileNotFoundError(f"No listings.parquet under {root}")
+        raise FileNotFoundError(f"No analytics parquet under {ANALYSIS_DIR}/**/listings.parquet")
     return candidates[-1]
 
+# --- Trimming config (env-driven) --------------------------------------------
 
-_M2_RE = re.compile(r"(\d{1,4}(?:[.,]\d{1,2})?)\s*(?:m2|m²|sqm|m\^2)\b", re.I)
+@dataclass
+class TrimCfg:
+    mode: str = os.environ.get("IMMO_TRAIN_TRIM", "qcut")  # "qcut" or "none"
+    quantiles: Tuple[float, float] = tuple(
+        float(x.strip()) for x in os.environ.get("IMMO_TRAIN_Q", "0.05,0.95").split(",")
+    )  # type: ignore
 
-def _parse_m2(text: str | float | int | None) -> Optional[float]:
-    if text is None:
-        return None
-    s = str(text)
-    m = _M2_RE.search(s)
-    if not m:
-        return None
-    val = m.group(1).replace(",", ".")
-    try:
-        return float(val)
-    except Exception:
-        return None
+    def should(self) -> bool:
+        return self.mode.lower() in {"qcut", "quantile", "quantiles"}
 
+# --- Guards & builders --------------------------------------------------------
 
-def _ensure_numeric(df: pd.DataFrame, cols) -> pd.DataFrame:
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
-
-def _price_unit_guard(df: pd.DataFrame, price_col: str = "price") -> None:
-    """If prices look like thousands (k€), multiply by 1_000."""
-    if price_col not in df.columns:
-        return
-    s = pd.to_numeric(df[price_col], errors="coerce")
-    if s.notna().sum() == 0:
-        return
-    q90 = s.quantile(0.90)
-    mx = s.max()
-    med = s.median()
-    # Heuristic: values like 840, 1200, 2500 typically mean k€
-    if q90 is not None and mx is not None and q90 < 10_000 and mx < 100_000:
-        LOG.info("Price unit guard applied (k€→€). stats before: med=%.1f, q90=%.1f, max=%.1f", med, q90, mx)
-        df[price_col] = s * 1_000
-
-
-def _compute_price_per_m2(df: pd.DataFrame) -> None:
-    if "price" in df.columns and "surface_m2" in df.columns:
-        p = pd.to_numeric(df["price"], errors="coerce")
-        m = pd.to_numeric(df["surface_m2"], errors="coerce")
-        with np.errstate(divide="ignore", invalid="ignore"):
-            df["price_per_m2"] = np.where(m > 0, p / m, np.nan)
+def _price_unit_guard(df: pd.DataFrame):
+    """If prices look like k€ (e.g. med ~250, q90 ~500, max ~8501), multiply by 1_000."""
+    if "price" not in df:
+        return df, {"applied": False}
+    s = pd.to_numeric(df["price"], errors="coerce")
+    med = float(s.median(skipna=True) or 0)
+    q90 = float(s.quantile(0.9) or 0)
+    mx = float(s.max(skipna=True) or 0)
+    info = {"before": {"median": med, "q90": q90, "max": mx}}
+    # Heuristic: likely k€ if q90 < 10k and max < 100k
+    if q90 and q90 < 10000 and mx < 100000:
+        df = df.copy()
+        df["price"] = (s * 1000).round().astype("Int64")
+        info["applied"] = True
+        log.info("Price unit guard applied (k€→€). stats before: med=%.1f, q90=%.1f, max=%.1f", med, q90, mx)
     else:
-        df["price_per_m2"] = np.nan
+        info["applied"] = False
+    return df, info
 
+def _build_training(df: pd.DataFrame, trim: TrimCfg):
+    meta = {"n_in": int(len(df))}
 
-def _title_surface_backfill(df: pd.DataFrame) -> None:
-    """Last-chance surface_m2 extraction from text columns."""
-    if "surface_m2" not in df.columns:
-        df["surface_m2"] = np.nan
-    s = pd.to_numeric(df["surface_m2"], errors="coerce")
-    missing = s.isna()
-    if not missing.any():
-        return
-    candidates = []
-    for col in ["title", "summary", "description"]:
-        if col in df.columns:
-            candidates.append(df[col].astype("string", copy=False))
-    if not candidates:
-        return
-    txt = pd.concat(candidates, axis=1)
-    # row-wise parse: first non-null parse wins
-    parsed = txt.apply(lambda row: next((v for v in (_parse_m2(x) for x in row) if v is not None), np.nan), axis=1)
-    fill_count_before = int(df["surface_m2"].notna().sum())
-    df.loc[missing, "surface_m2"] = df.loc[missing, "surface_m2"].fillna(parsed[missing])
-    fill_count_after = int(df["surface_m2"].notna().sum())
-    gained = fill_count_after - fill_count_before
-    if gained > 0:
-        LOG.info("surface_m2 backfilled from text: +%d rows", gained)
+    # Keep essential columns
+    cols = [
+        "url", "title", "price", "surface_m2", "bedrooms", "bathrooms",
+        "postal_code", "city", "region", "property_type", "year_built",
+        "energy_label", "snapshot_date",
+    ]
+    keep = [c for c in cols if c in df.columns]
+    df = df[keep].copy()
 
-
-def _choose_trim_strategy() -> Tuple[str, float, float, int]:
-    strat = os.environ.get("IMMO_TRAIN_TRIM", "iqr").lower()
-    lo, hi = 0.05, 0.95
-    q = os.environ.get("IMMO_TRAIN_Q")
-    if q:
+    # Keep latest per URL if snapshot present
+    if "url" in df.columns and "snapshot_date" in df.columns:
         try:
-            lo, hi = [float(x.strip()) for x in q.split(",")]
+            df["snapshot_ts"] = pd.to_datetime(df["snapshot_date"], errors="coerce")
+            df = df.sort_values("snapshot_ts").groupby("url", as_index=False).tail(1)
         except Exception:
             pass
-    min_group = int(os.environ.get("IMMO_TRAIN_MIN_GROUP", "20"))
-    return strat, lo, hi, min_group
 
+    # Last-chance backfill of surface
+    if "surface_m2" not in df.columns:
+        df["surface_m2"] = pd.NA
+    miss = df["surface_m2"].isna()
+    if miss.any():
+        extracted = df.loc[miss].apply(_extract_surface_any, axis=1)
+        df.loc[miss, "surface_m2"] = extracted
+        meta["surface_filled"] = int(df["surface_m2"].notna().sum())
 
-def _trim_iqr_fences(s: pd.Series) -> pd.Series:
-    q1 = s.quantile(0.25)
-    q3 = s.quantile(0.75)
-    iqr = q3 - q1
-    lo = q1 - 1.5 * iqr
-    hi = q3 + 1.5 * iqr
-    return (s >= lo) & (s <= hi)
+    # Numeric coercions
+    for c in ("price", "surface_m2", "bedrooms", "bathrooms", "year_built"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    # Sanity
+    if "price" in df.columns:
+        df = df[df["price"] > 0]
+    if "surface_m2" in df.columns:
+        df.loc[df["surface_m2"] <= 5, "surface_m2"] = pd.NA  # unrealistic tiny
 
-def _trim_middle50(s: pd.Series) -> pd.Series:
-    q1 = s.quantile(0.25)
-    q3 = s.quantile(0.75)
-    return (s >= q1) & (s <= q3)
+    # price_per_m2 when possible
+    if "price" in df.columns and "surface_m2" in df.columns:
+        denom = pd.to_numeric(df["surface_m2"], errors="coerce")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ppm2 = pd.to_numeric(df["price"], errors="coerce") / denom
+        df["price_per_m2"] = ppm2.where(denom > 0)
 
+    # Target choice for trimming only (model code will decide separately)
+    target = "price_per_m2" if ("price_per_m2" in df and df["price_per_m2"].notna().any()) else "price"
+    meta["trim_target"] = target
 
-def _apply_trimming(df: pd.DataFrame) -> pd.DataFrame:
-    strat, lo, hi, min_group = _choose_trim_strategy()
+    # Env-driven trimming
+    if trim.should() and target in df.columns:
+        s = pd.to_numeric(df[target], errors="coerce")
+        q_lo, q_hi = df[target].quantile(trim.quantiles[0]), df[target].quantile(trim.quantiles[1])
+        before = len(df)
+        df = df[(s >= q_lo) & (s <= q_hi)]
+        meta["trim"] = {
+            "mode": trim.mode,
+            "q": list(trim.quantiles),
+            "range": [float(q_lo), float(q_hi)],
+            "dropped": before - len(df),
+        }
 
-    # Work on price_per_m2 if available, else price
-    target = "price_per_m2" if "price_per_m2" in df.columns and df["price_per_m2"].notna().any() else "price"
-    s = pd.to_numeric(df[target], errors="coerce")
-
-    kept_mask = pd.Series(True, index=df.index)
-
-    if strat == "qcut":
-        lo_v, hi_v = s.quantile(lo), s.quantile(hi)
-        kept_mask &= (s >= lo_v) & (s <= hi_v)
-        LOG.info("Trimming strategy=qcut kept %.0f–%.0f%% range on %s (%.0f..%.0f).",
-                 lo*100, hi*100, target, lo_v or np.nan, hi_v or np.nan)
-
+    # Final NA policy
+    if target == "price":
+        df = df[df["price"].notna()]
     else:
-        # per-bucket trimming by (region, property_type) if present
-        by = [c for c in ["region", "property_type"] if c in df.columns]
-        if not by:
-            by = None
+        df = df[df["price_per_m2"].notna()]
 
-        if by:
-            kept = []
-            for keys, g in df.groupby(by):
-                s_g = pd.to_numeric(g[target], errors="coerce")
-                if s_g.notna().sum() < max(min_group, 4):
-                    kept.append(pd.Series(True, index=g.index))
-                    continue
-                if strat == "middle50":
-                    m = _trim_middle50(s_g)
-                else:  # "iqr" default
-                    m = _trim_iqr_fences(s_g)
-                kept.append(m.reindex(g.index, fill_value=True))
-            kept_mask &= pd.concat(kept).reindex(df.index, fill_value=True)
-            LOG.info("Trimming strategy=%s applied per-bucket %s on %s", strat, by, target)
-        else:
-            if s.notna().sum() >= 4:
-                if strat == "middle50":
-                    kept_mask &= _trim_middle50(s)
-                else:
-                    kept_mask &= _trim_iqr_fences(s)
-                LOG.info("Trimming strategy=%s applied globally on %s", strat, target)
+    meta["n_out"] = int(len(df))
+    return df, meta
 
-    before, after = len(df), int(kept_mask.sum())
-    LOG.info("Trimmed rows: kept %d / %d (%.1f%%)", after, before, 100.0 * after / max(before, 1))
-    return df[kept_mask].copy()
+# --- Public entrypoint --------------------------------------------------------
 
-
-# ---------------------------
-# Main
-# ---------------------------
-
-def run() -> str:
-    """Build training parquet with optional outlier trimming."""
-    src = _latest_processed_analysis_parquet()
+def run(save: bool = True) -> str:
+    """Build the training dataset from the latest processed analytics parquet and save it."""
+    src = _latest_analytics_parquet()
     df = pd.read_parquet(src)
 
-    # Ensure key columns exist
-    for col in [
-        "price", "surface_m2", "postal_code", "city", "region",
-        "property_type", "bedrooms", "bathrooms", "year_built",
-        "energy_label", "title", "snapshot_date", "is_sale"
-    ]:
-        if col not in df.columns:
-            df[col] = pd.NA
+    # k€ → €
+    df, guard = _price_unit_guard(df)
 
-    # Numeric casts
-    _ensure_numeric(df, ["price", "surface_m2", "bedrooms", "bathrooms", "year_built"])
+    trim = TrimCfg()
+    out, meta = _build_training(df, trim)
 
-    # Price unit guard (k€ → €) before any derived columns
-    _price_unit_guard(df, "price")
-
-    # Backfill surface from text if missing
-    _title_surface_backfill(df)
-
-    # Compute price_per_m2 where possible
-    _compute_price_per_m2(df)
-
-    # Keep for-sale only (if flag present; otherwise assume all are for sale in this dataset)
-    if "is_sale" in df.columns and df["is_sale"].notna().any():
-        df = df[df["is_sale"] == True].copy()
-
-    # Basic quality gates (very permissive—model can handle missing via pipelines)
-    # Keep rows that have price OR surface (we still allow one missing; pipelines can impute)
-    price_ok = pd.to_numeric(df["price"], errors="coerce") > 30_000
-    surface_ok = pd.to_numeric(df["surface_m2"], errors="coerce") >= 10
-    df = df[price_ok | surface_ok].copy()
-
-    # Outlier trimming (configurable)
-    df = _apply_trimming(df)
-
-    # Final feature set for training parquet
-    feat_cols = [
-        "price", "surface_m2", "price_per_m2",
-        "bedrooms", "bathrooms",
-        "postal_code", "city", "region",
-        "property_type", "year_built", "energy_label",
-    ]
-    train = df[feat_cols].copy()
-
-    # Save under processed/training/<snapshot_date>/training.parquet
-    # Prefer snapshot_date if present and not null; otherwise today's date
-    snap = df["snapshot_date"].dropna()
-    if len(snap) and str(snap.iloc[0]):
-        try:
-            # snapshot_date may be string or date
-            snap_date = pd.to_datetime(str(snap.iloc[0])).date()
-        except Exception:
-            snap_date = pd.Timestamp.today().date()
-    else:
-        snap_date = pd.Timestamp.today().date()
-
-    out_dir = Path("data/processed/training") / str(snap_date)
+    # Save under data/processed/training/YYYY-MM-DD/training.parquet
+    day = datetime.utcnow().strftime("%Y-%m-%d")
+    out_dir = TRAINING_DIR / day
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / "training.parquet"
-    train.to_parquet(out, index=False)
+    out_path = out_dir / "training.parquet"
+    if save:
+        out.to_parquet(out_path, index=False)
+        log.info("Training dataset saved -> %s (%d rows)", out_path.as_posix(), len(out))
 
-    LOG.info("Training dataset saved -> %s (%d rows)", out, len(train))
-    return str(out)
+    # Tiny metadata
+    meta_path = out_dir / "metadata.json"
+    meta_doc = {
+        "source": src.as_posix(),
+        "saved": out_path.as_posix(),
+        "created_utc": datetime.utcnow().isoformat(timespec="seconds"),
+        "price_guard": guard,
+        **meta,
+    }
+    meta_path.write_text(json.dumps(meta_doc, indent=2))
 
+    return out_path.as_posix()
 
 if __name__ == "__main__":
     print(run())

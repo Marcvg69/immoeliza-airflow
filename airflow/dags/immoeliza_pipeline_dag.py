@@ -20,14 +20,16 @@ Notes:
     IMMO_ANALYTICS_DB   -> path to DuckDB (default analytics/immoeliza.duckdb)
 """
 
-from __future__ import annotations
-
-import os
+# airflow/dags/immoeliza_pipeline_dag.py
+import os, sys, pathlib
 import pendulum
+from __future__ import annotations
 from datetime import timedelta
-
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]  # repo root
+sys.path.insert(0, str(ROOT / "src"))
 
 # --------- Thin wrappers so operators have stable callables ---------
 

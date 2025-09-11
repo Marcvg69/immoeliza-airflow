@@ -1,214 +1,298 @@
 # webui/app.py
 from __future__ import annotations
 
-import json
 import os
-import re
-import subprocess
 import sys
-from datetime import datetime
+import glob
+import json
 from pathlib import Path
-from typing import List, Optional
+from datetime import datetime
 
-import duckdb
+import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
-# (optional) if you want to call auto-predict elsewhere
-# from predict_helper import auto_predict
+# Optional: DuckDB for market views (safe if not present)
+try:
+    import duckdb  # type: ignore
+except Exception:
+    duckdb = None  # UI will degrade gracefully
 
-DB = os.getenv("IMMO_ANALYTICS_DB", "analytics/immoeliza.duckdb")
-PROCESSED_ANALYSIS_DIR = Path("data/processed/analysis")  # where the cleaner writes daily outputs
+# --- Project paths (env overrides allowed) ---
+REPO_ROOT = Path(os.environ.get("IMMO_REPO_ROOT", Path.cwd()))
+ANALYTICS_DUCKDB = Path(os.environ.get("IMMO_ANALYTICS_DB", REPO_ROOT / "analytics" / "immoeliza.duckdb"))
+ANALYTICS_GLOB = os.environ.get("IMMO_ANALYTICS_GLOB", str(REPO_ROOT / "data" / "processed" / "analysis" / "*" / "listings.parquet"))
+TRAINING_GLOB = os.environ.get("IMMO_TRAINING_GLOB", str(REPO_ROOT / "data" / "processed" / "training" / "*" / "training.parquet"))
+MODELS_DIR = Path(os.environ.get("IMMO_MODELS_DIR", REPO_ROOT / "models"))
 
-st.set_page_config(page_title="ImmoEliza Market", layout="wide")
-st.title("🏢 ImmoEliza Market Dashboard")
+APP_TITLE = "ImmoEliza — Market & Predict"
 
+# Try to import the helper the way you structured it (same folder as app.py)
+# i.e. webui/predict_helper.py -> "from predict_helper import auto_predict"
+def _import_auto_predict():
+    try:
+        from predict_helper import auto_predict  # local helper preferred
+        return auto_predict
+    except Exception:
+        # Fallback: allow running app without helper (degraded)
+        def _fallback_auto_predict(features: dict) -> dict:
+            # crude pick: use €/m² model if surface is present & > 0
+            has_m2 = float(features.get("surface_m2") or 0) > 0
+            target = "price_per_m2" if has_m2 else "price"
+            # choose latest model/metadata on disk
+            meta = sorted(MODELS_DIR.glob(f"metadata_*_{'price_per_m2' if target=='price_per_m2' else 'price'}*.json")) \
+                or sorted(MODELS_DIR.glob("metadata_*.json"))
+            model = sorted(MODELS_DIR.glob(f"*{target}*.joblib")) or sorted(MODELS_DIR.glob("*.joblib"))
+            return {
+                "target": target,
+                "pred": {"price": None, "price_per_m2": None},  # nothing computed in fallback
+                "model_path": str(model[-1]) if model else None,
+                "metadata_path": str(meta[-1]) if meta else None,
+                "features_used": [],
+            }
+        return _fallback_auto_predict
+
+auto_predict = _import_auto_predict()
+
+# ---------- Tiny utils ----------
+def _mtime(path: Path | None) -> str:
+    if not path or not Path(path).exists():
+        return "—"
+    ts = datetime.fromtimestamp(Path(path).stat().st_mtime)
+    return ts.strftime("%Y-%m-%d %H:%M:%S")
+
+def _latest(path_glob: str) -> Path | None:
+    files = sorted(glob.glob(path_glob))
+    return Path(files[-1]) if files else None
+
+@st.cache_data(show_spinner=False)
+def _read_parquet(p: Path | None) -> pd.DataFrame:
+    if not p or not p.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(p)
+
+def _fmt_int(x) -> str:
+    try:
+        return f"{int(x):,}".replace(",", " ")
+    except Exception:
+        return "—"
+
+def _fmt_eur(x) -> str:
+    try:
+        return f"{float(x):,.0f} €".replace(",", " ")
+    except Exception:
+        return "—"
+
+# ---------- Rebuild actions (call your package code) ----------
+def _rebuild_analytics():
+    with st.spinner("Rebuilding analytics (clean → upsert)…"):
+        try:
+            # Your module paths (as you have them)
+            from immoeliza.cleaning.analysis_clean import run as run_analysis
+            res = run_analysis()
+            st.success(f"Analytics rebuilt: {res}")
+        except Exception as e:
+            st.error(f"Analytics rebuild failed: {e}")
+
+def _rebuild_training_and_train():
+    with st.spinner("Rebuilding training set and retraining…"):
+        try:
+            from immoeliza.cleaning.training_clean import run as run_training
+            from immoeliza.modeling.train_regression import train as train_model
+
+            training_path = run_training()
+            if isinstance(training_path, (list, tuple)):
+                training_path = training_path[-1]
+            elif isinstance(training_path, dict):
+                training_path = training_path.get("training_path", training_path.get("path", ""))
+
+            if not training_path or not Path(training_path).exists():
+                raise RuntimeError(f"Training parquet not found: {training_path}")
+
+            result = train_model(str(training_path))
+            st.success(f"Training OK. Chosen: {result.get('metrics', {}).get('chosen')}")
+            with st.expander("Training details"):
+                st.json(result)
+        except Exception as e:
+            st.error(f"Training failed: {e}")
+
+# ---------- Sanity summary (non-destructive) ----------
+@st.cache_data(show_spinner=False)
+def sanity_summary(analytics_parquet: Path | None) -> dict:
+    """
+    Read latest analytics parquet and compute a small summary of what would be dropped
+    by obvious rules (not writing anything; just reporting).
+    """
+    df = _read_parquet(analytics_parquet).copy()
+    if df.empty:
+        return {"total": 0, "drop_missing_price": 0, "drop_missing_m2": 0,
+                "drop_bad_m2": 0, "drop_bad_ppm2": 0, "kept": 0}
+
+    # normalize columns we care about
+    for col in ["price", "surface_m2", "price_per_m2"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    total = len(df)
+    m_missing_price = df["price"].isna()
+    m_missing_m2 = df["surface_m2"].isna()
+    # basic plausibility
+    m_bad_m2 = (~m_missing_m2) & ((df["surface_m2"] < 10) | (df["surface_m2"] > 1000))
+    ppm2 = np.where((~df["price"].isna()) & (~df["surface_m2"].isna()) & (df["surface_m2"] > 0),
+                    df["price"] / df["surface_m2"], np.nan)
+    m_bad_ppm2 = (~np.isnan(ppm2)) & ((ppm2 < 500) | (ppm2 > 50000))
+
+    drop = m_missing_price | m_missing_m2 | m_bad_m2 | m_bad_ppm2
+    kept = total - int(drop.sum())
+
+    return {
+        "total": int(total),
+        "drop_missing_price": int(m_missing_price.sum()),
+        "drop_missing_m2": int(m_missing_m2.sum()),
+        "drop_bad_m2": int(m_bad_m2.sum()),
+        "drop_bad_ppm2": int(m_bad_ppm2.sum()),
+        "kept": int(kept),
+    }
 
 # ---------- DuckDB helpers ----------
-def list_tables(db_path: str) -> List[str]:
-    try:
-        con = duckdb.connect(db_path, read_only=True)
-        rows = con.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema='main' ORDER BY table_name"
-        ).fetchall()
-        con.close()
-        return [r[0] for r in rows]
-    except Exception:
-        return []
+def _have_duckdb() -> bool:
+    return duckdb is not None and ANALYTICS_DUCKDB.exists()
 
-
-def load_latest(db_path: str) -> pd.DataFrame:
-    try:
-        con = duckdb.connect(db_path, read_only=True)
-        df = con.execute("SELECT * FROM listings_latest ORDER BY snapshot_date DESC").df()
-        con.close()
-        return df
-    except Exception:
+def _q(sql: str, params: tuple = ()):
+    if not _have_duckdb():
         return pd.DataFrame()
-
-
-def _find_latest_sanity_json() -> Optional[Path]:
-    if not PROCESSED_ANALYSIS_DIR.exists():
-        return None
-    dated = sorted([p for p in PROCESSED_ANALYSIS_DIR.iterdir() if p.is_dir()])
-    if not dated:
-        return None
-    cand = dated[-1] / "sanity_summary.json"
-    return cand if cand.exists() else None
-
-
-def _load_sanity_summary() -> Optional[dict]:
-    p = _find_latest_sanity_json()
-    if not p:
-        return None
+    con = duckdb.connect(str(ANALYTICS_DUCKDB))
     try:
-        return json.loads(p.read_text())
-    except Exception:
-        return None
+        return con.execute(sql, params).df()
+    finally:
+        con.close()
 
+# ===================== UI =====================
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
 
-# ---------- Sidebar ----------
+# Sidebar actions
 with st.sidebar:
-    st.markdown("**DB:**")
-    st.code(DB)
-    tabs = list_tables(DB)
-    st.caption("Tables: " + (", ".join(tabs) if tabs else "—"))
+    st.subheader("Actions")
+    if st.button("Rebuild analytics (clean → upsert)", use_container_width=True):
+        _rebuild_analytics()
+
+    if st.button("Rebuild training + retrain", use_container_width=True):
+        _rebuild_training_and_train()
 
     st.divider()
+    st.caption(f"Analytics DB: `{ANALYTICS_DUCKDB}`")
+    st.caption(f"Models dir: `{MODELS_DIR}`")
 
-    # Rebuild analytics (clean -> upsert) via subprocess to avoid DB locks
-    if st.button("🔁 Rebuild analytics (clean → upsert)", use_container_width=True):
-        with st.spinner("Rebuilding analytics…"):
+tabs = st.tabs(["Market", "Predict"])
+
+# -------- Market tab --------
+with tabs[0]:
+    c1, c2 = st.columns([2, 3])
+
+    with c1:
+        st.subheader("Latest listings (sample)")
+        if _have_duckdb():
             try:
-                proc = subprocess.run(
-                    [
-                        sys.executable,
-                        "-c",
-                        "from immoeliza.cleaning.analysis_clean import run as r; print(r())",
-                    ],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                st.success("Analytics rebuilt.")
-                # Try to extract path lines (optional)
-                if proc.stdout:
-                    st.expander("Build logs", expanded=False).code(proc.stdout)
-                if proc.stderr:
-                    st.expander("Warnings/Errors", expanded=False).code(proc.stderr)
-                # refresh session-level cache for footer
-                st.session_state["last_rebuild_at"] = datetime.now().isoformat(timespec="seconds")
-                st.session_state["sanity_summary"] = _load_sanity_summary()
-                st.rerun()
-            except subprocess.CalledProcessError as e:
-                st.error("Rebuild failed.")
-                with st.expander("Error logs", expanded=True):
-                    st.code(e.stdout or "(no stdout)")
-                    st.code(e.stderr or "(no stderr)")
+                df_latest = _q("SELECT * FROM listings_latest ORDER BY snapshot_ts DESC LIMIT 200;")
+                st.dataframe(df_latest, use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.info(f"Could not read `listings_latest`: {e}")
+        else:
+            st.info("No DuckDB found yet. Rebuild analytics or run the DAG.")
 
-# ---------- Data + Filters ----------
-df_latest = load_latest(DB)
-if df_latest.empty:
-    st.info("No data in `listings_latest`. Run the pipeline or use the rebuild button in the sidebar.")
-    # Footer (still show last summary if present)
-    ss = st.session_state.get("sanity_summary") or _load_sanity_summary()
-    if ss:
-        st.caption(
-            f"Last rebuild: {ss.get('when','?')} • dropped: "
-            f"duplicates={ss.get('dropped_duplicates',0)}, "
-            f"bad_price_for_sale={ss.get('dropped_bad_price_for_sale',0)}, "
-            f"surface_outlier={ss.get('dropped_surface_outlier',0)}, "
-            f"ppm2_outlier={ss.get('dropped_ppm2_outlier',0)}, "
-            f"null_keys={ss.get('dropped_null_key',0)}"
+        st.subheader("Daily market summary")
+        if _have_duckdb():
+            try:
+                df_sum = _q("SELECT * FROM market_daily_summary ORDER BY snapshot_date DESC LIMIT 60;")
+                st.dataframe(df_sum, use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.info(f"Could not read `market_daily_summary`: {e}")
+
+    with c2:
+        st.subheader("Sanity summary")
+        latest_analytics = _latest(ANALYTICS_GLOB)
+        s = sanity_summary(latest_analytics)
+        st.markdown(
+            f"""
+**Total rows:** {_fmt_int(s['total'])}  
+- Missing price: {_fmt_int(s['drop_missing_price'])}  
+- Missing m²: {_fmt_int(s['drop_missing_m2'])}  
+- Implausible m² (<10 or >1000): {_fmt_int(s['drop_bad_m2'])}  
+- Implausible €/m² (<500 or >50,000): {_fmt_int(s['drop_bad_ppm2'])}  
+
+**Kept after sanity:** {_fmt_int(s['kept'])}
+"""
         )
-    st.stop()
 
-flt1, flt2, flt3, flt4 = st.columns([1, 1, 1, 1])
+# -------- Predict tab --------
+with tabs[1]:
+    st.subheader("Quick predict")
 
-cities = ["(all)"] + sorted(
-    c for c in df_latest.get("city", pd.Series([], dtype=str)).dropna().astype(str).unique() if c and c != "None"
+    with st.form("predict_form"):
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            price = st.number_input("Advertised price (€)", min_value=0, step=1000, value=0)
+            surface_m2 = st.number_input("Living area (m²)", min_value=0, step=1, value=0)
+            bedrooms = st.number_input("Bedrooms", min_value=0, step=1, value=2)
+
+        with c2:
+            bathrooms = st.number_input("Bathrooms", min_value=0, step=1, value=1)
+            year_built = st.number_input("Year built", min_value=1800, max_value=2100, step=1, value=2000)
+            energy_label = st.selectbox("Energy label", ["", "A", "B", "C", "D", "E", "F", "G"])
+
+        with c3:
+            postal_code = st.text_input("Postal code", value="")
+            city = st.text_input("City", value="")
+            property_type = st.selectbox("Property type", ["", "apartment", "house", "duplex", "studio", "villa"])
+
+        submitted = st.form_submit_button("Predict")
+        if submitted:
+            try:
+                features = {
+                    "price": float(price) if price else None,
+                    "surface_m2": float(surface_m2) if surface_m2 else None,
+                    "bedrooms": int(bedrooms),
+                    "bathrooms": int(bathrooms),
+                    "year_built": int(year_built) if year_built else None,
+                    "postal_code": postal_code.strip() or None,
+                    "city": city.strip() or None,
+                    "property_type": property_type or None,
+                    "energy_label": energy_label or None,
+                }
+                res = auto_predict(features)  # helper decides the right model
+
+                pred = res.get("pred", {})
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    p = pred.get("price")
+                    st.metric("Predicted price", _fmt_eur(p) if p else "—")
+                with cc2:
+                    p2 = pred.get("price_per_m2")
+                    st.metric("Predicted €/m²", f"{p2:,.0f} €/m²".replace(",", " ") if p2 else "—")
+
+                with st.expander("Model details"):
+                    st.write("**Model file**:", Path(res["model_path"]).name if res.get("model_path") else "—")
+                    st.write("**Metadata**:", Path(res["metadata_path"]).name if res.get("metadata_path") else "—")
+                    st.json({"features_used": res.get("features_used", []), "target": res.get("target")})
+            except Exception as e:
+                st.error(f"Prediction failed: {e}")
+
+# -------- Footer --------
+st.divider()
+latest_analytics = _latest(ANALYTICS_GLOB)
+latest_training = _latest(TRAINING_GLOB)
+latest_meta = max(MODELS_DIR.glob("metadata_*.json"), default=None, key=lambda p: p.stat().st_mtime) if MODELS_DIR.exists() else None
+
+st.caption(
+    "📦 **Paths** — "
+    f"Analytics parquet: `{latest_analytics or '—'}` | "
+    f"Training parquet: `{latest_training or '—'}` | "
+    f"Models dir: `{MODELS_DIR}` | "
+    f"DuckDB: `{ANALYTICS_DUCKDB}`"
 )
-ptypes = ["(all)"] + sorted(
-    c for c in df_latest.get("property_type", pd.Series([], dtype=str)).dropna().astype(str).unique() if c and c != "None"
+st.caption(
+    "⏱ **Last rebuild** — "
+    f"analytics: {_mtime(latest_analytics)} | training: {_mtime(latest_training)} | model: {_mtime(latest_meta)}"
 )
-
-with flt1:
-    city = st.selectbox("City", cities, index=0)
-with flt2:
-    ptype = st.selectbox("Property type", ptypes, index=0)
-with flt3:
-    postal_filter = st.text_input("Postal code contains", "")
-with flt4:
-    only_complete = st.checkbox("Hide rows with missing\ncity/postal/price/surface", value=False)
-
-q = df_latest.copy()
-if city != "(all)":
-    q = q[q["city"].astype(str) == city]
-if ptype != "(all)":
-    q = q[q["property_type"].astype(str) == ptype]
-if postal_filter:
-    q = q[q["postal_code"].astype(str).str.contains(postal_filter, na=False)]
-if only_complete:
-    q = q.dropna(subset=["city", "postal_code", "price", "surface_m2"])
-
-st.caption(f"Listings ({len(q):,})")
-st.dataframe(
-    q[
-        [
-            "url",
-            "price",
-            "bedrooms",
-            "bathrooms",
-            "surface_m2",
-            "year_built",
-            "title",
-            "city",
-            "postal_code",
-            "property_type",
-            "price_per_m2",
-            "snapshot_date",
-        ]
-    ].reset_index(drop=True),
-    use_container_width=True,
-    height=320,
-)
-
-# ---------- Quick chart + group stats ----------
-col_l, col_r = st.columns([1, 1])
-with col_r:
-    if "price_per_m2" in q.columns and q["price_per_m2"].notna().any():
-        fig = px.histogram(q[q["price_per_m2"].notna()], x="price_per_m2", nbins=20, title="Price per m²")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No price_per_m2 values to plot.")
-
-st.subheader("Median €/m² by City & Property Type")
-roll = (
-    q.dropna(subset=["price_per_m2"])
-    .groupby(["city", "property_type"], dropna=False)["price_per_m2"]
-    .median()
-    .reset_index()
-    .sort_values("price_per_m2", ascending=False)
-)
-st.dataframe(roll, use_container_width=True)
-
-# ---------- Download filtered ----------
-csv = q.to_csv(index=False).encode("utf-8")
-st.download_button("Download filtered CSV", csv, file_name="listings_filtered.csv", mime="text/csv")
-
-# ---------- Footer: last rebuild + sanity summary ----------
-ss = st.session_state.get("sanity_summary") or _load_sanity_summary()
-when = st.session_state.get("last_rebuild_at")
-if ss:
-    when = when or ss.get("when")
-    st.caption(
-        f"Last rebuild: {when} • dropped: "
-        f"duplicates={ss.get('dropped_duplicates',0)}, "
-        f"bad_price_for_sale={ss.get('dropped_bad_price_for_sale',0)}, "
-        f"surface_outlier={ss.get('dropped_surface_outlier',0)}, "
-        f"ppm2_outlier={ss.get('dropped_ppm2_outlier',0)}, "
-        f"null_keys={ss.get('dropped_null_key',0)}"
-    )
-else:
-    st.caption("Last rebuild: –  •  (no sanity summary yet)")
