@@ -1,0 +1,115 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  airflow-init:
+    image: apache/airflow:2.9.3-python3.11
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: [.env]
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      PYTHONPATH: /opt/airflow/src
+      # fallbacks if IMMOELIZA_* not set in .env:
+      IMMOELIZA_ANALYTICS_PATH: ${IMMOELIZA_ANALYTICS_PATH:-/opt/airflow/analytics/immoeliza.duckdb}
+      IMMOELIZA_MODELS_DIR: ${IMMOELIZA_MODELS_DIR:-/opt/airflow/models}
+    user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-0}"
+    command: >
+      bash -lc "
+      airflow db migrate &&
+      airflow users create -r Admin -u ${_AIRFLOW_WWW_USER_USERNAME:-admin} -p ${_AIRFLOW_WWW_USER_PASSWORD:-admin}
+        -f ${_AIRFLOW_WWW_USER_FIRSTNAME:-Admin} -l ${_AIRFLOW_WWW_USER_LASTNAME:-User}
+        -e ${_AIRFLOW_WWW_USER_EMAIL:-you@example.com} || true"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./src:/opt/airflow/src
+      - ./analytics:/opt/airflow/analytics
+      - ./models:/opt/airflow/models
+      - ./data:/opt/airflow/data   # <-- add this
+
+  airflow-webserver:
+    image: apache/airflow:2.9.3-python3.11
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    env_file: [.env]
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      PYTHONPATH: /opt/airflow/src
+    user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-0}"
+    ports: ["8080:8080"]
+    command: ["bash", "-lc", "airflow webserver"]
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./src:/opt/airflow/src
+      - ./analytics:/opt/airflow/analytics
+      - ./models:/opt/airflow/models
+      - ./data:/opt/airflow/data     # <-- add this
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.3-python3.11
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    env_file: [.env]
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      PYTHONPATH: /opt/airflow/src
+    user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-0}"
+    command: ["bash", "-lc", "airflow scheduler"]
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./src:/opt/airflow/src
+      - ./analytics:/opt/airflow/analytics
+      - ./models:/opt/airflow/models
+      - ./data:/opt/airflow/data     # <-- add this
+
+  webui:
+    image: python:3.11-slim
+    depends_on:
+      airflow-webserver:
+        condition: service_started
+    working_dir: /app
+    env_file: [.env]
+    environment:
+      PYTHONPATH: /app/src
+      # Streamlit will read IMMOELIZA_* from env_file
+    command: >
+      bash -lc "
+      pip install --no-cache-dir streamlit duckdb pandas numpy scikit-learn joblib &&
+      streamlit run webui/app.py --server.port 8501 --server.address 0.0.0.0"
+    ports: ["8501:8501"]
+    volumes:
+      - ./:/app
+      - ./analytics:/app/analytics
+      - ./models:/app/models
+      - ./data:/app/data          # <-- add this
+
+volumes:
+  pgdata:
